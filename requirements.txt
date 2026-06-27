@@ -1,4 +1,5 @@
 flask>=3.0
+gunicorn>=22.0
 pymupdf>=1.24
 tldextract>=5.0
 python-dotenv>=1.0

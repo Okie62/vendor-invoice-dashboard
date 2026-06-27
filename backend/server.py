@@ -7,6 +7,7 @@ Serves:
 """
 
 import logging
+import os
 from pathlib import Path
 
 from flask import Flask, jsonify, request, send_from_directory, abort
@@ -14,7 +15,7 @@ from flask import Flask, jsonify, request, send_from_directory, abort
 from db import init_db, get_db
 from pdf_parser import parse_pdf
 from ingest import ensure_vendor, store_invoice
-from config import INVOICE_DIR
+from config import DATA_DIR, INVOICE_DIR, DB_PATH
 
 logging.basicConfig(
     level=logging.INFO,
@@ -22,6 +23,12 @@ logging.basicConfig(
 )
 
 app = Flask(__name__, static_folder="../frontend", static_url_path="")
+
+# Initialize database on startup (works with gunicorn, not just __main__)
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+INVOICE_DIR.mkdir(parents=True, exist_ok=True)
+DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+init_db()
 
 
 # ---------------------------------------------------------------------------
@@ -189,4 +196,5 @@ def download_pdf(invoice_id):
 
 if __name__ == "__main__":
     init_db()
-    app.run(host="0.0.0.0", port=8080, debug=True, use_reloader=False)
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port, debug=True, use_reloader=False)

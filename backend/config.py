@@ -9,8 +9,8 @@ from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).parent.parent / ".env")
 
-# Paths
-BASE_DIR = Path(__file__).parent.parent
+# Paths — use RENDER env var if on Render, otherwise local
+BASE_DIR = Path(os.environ.get("RENDER_PROJECT_DIR", Path(__file__).parent.parent))
 DATA_DIR = BASE_DIR / "data"
 INVOICE_DIR = DATA_DIR / "invoices"
 DB_PATH = DATA_DIR / "db" / "invoices.db"

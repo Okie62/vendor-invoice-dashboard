@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: vendor-invoice-dashboard
+    runtime: python
+    plan: starter
+    region: oregon
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn --chdir backend server:app --bind 0.0.0.0:$PORT
+    envVars:
+      - key: GMAIL_ADDRESS
+        sync: false
+      - key: GMAIL_APP_PASSWORD
+        sync: false
+      - key: PYTHON_VERSION
+        value: "3.11.9"
+    disk:
+      name: invoice-data
+      mountPath: /opt/render/project/src/data
+      sizeGB: 5
