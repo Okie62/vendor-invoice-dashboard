@@ -5,7 +5,7 @@ services:
     plan: starter
     region: oregon
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn --chdir backend server:app --bind 0.0.0.0:$PORT
+    startCommand: gunicorn --chdir backend runner:app --bind 0.0.0.0:$PORT
     envVars:
       - key: GMAIL_ADDRESS
         sync: false
