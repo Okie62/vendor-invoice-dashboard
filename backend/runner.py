@@ -16,6 +16,8 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+_poller_started = False
+
 from config import POLL_INTERVAL
 from ingest import run_ingestion
 from server import app, init_db
@@ -37,13 +39,24 @@ def poller_loop():
         time.sleep(POLL_INTERVAL)
 
 
-if __name__ == "__main__":
-    init_db()
-
-    # Start poller in background thread
+def start_poller_thread():
+    """Start the background email poller thread (if not already running)."""
+    global _poller_started
+    if _poller_started:
+        return
+    _poller_started = True
     poller_thread = threading.Thread(target=poller_loop, daemon=True)
     poller_thread.start()
+    log.info("Email poller thread started — polling every %d seconds", POLL_INTERVAL)
 
-    # Run the Flask app
+
+# When imported by gunicorn (runner:app), __name__ is "runner", not "__main__".
+# Start the poller thread at import time so it runs under gunicorn.
+init_db()
+start_poller_thread()
+
+
+if __name__ == "__main__":
+    # Run the Flask app directly (local dev)
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
