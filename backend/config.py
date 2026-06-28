@@ -47,6 +47,7 @@ VENDOR_ALIASES = {
     "wix":           "Wix",
     "canva":         "Canva",
     "adobe":         "Adobe",
+    "barracuda":     "Barracuda",
 }
 
 # Noise subdomain prefixes to strip
