@@ -159,9 +159,25 @@ def upload_pdf():
 
 @app.route("/api/poll", methods=["POST"])
 def trigger_poll():
-    """Manually trigger an email poll cycle."""
+    """Manually trigger an email poll cycle.
+
+    Query params:
+      ?reprocess=true  — clear processed_emails table first so all
+                         emails get reprocessed (useful after parser fixes)
+    """
     from ingest import run_ingestion
+    from db import get_db
     try:
+        if request.args.get("reprocess") in ("true", "1", "yes"):
+            conn = get_db()
+            conn.execute("DELETE FROM processed_emails")
+            conn.execute("DELETE FROM invoices")
+            conn.execute("DELETE FROM customers")
+            conn.execute("DELETE FROM line_items")
+            conn.execute("DELETE FROM vendors")
+            conn.commit()
+            conn.close()
+            logging.info("Cleared all processed_emails and invoice data for reprocessing")
         count = run_ingestion()
         return jsonify({"success": True, "processed": count})
     except Exception as e:
