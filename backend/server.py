@@ -157,6 +157,17 @@ def upload_pdf():
     return jsonify({"success": True, "invoice_id": parsed.invoice_id}), 201
 
 
+@app.route("/api/poll", methods=["POST"])
+def trigger_poll():
+    """Manually trigger an email poll cycle."""
+    from ingest import run_ingestion
+    try:
+        count = run_ingestion()
+        return jsonify({"success": True, "processed": count})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
 @app.route("/api/invoices/<invoice_id>", methods=["DELETE"])
 def delete_invoice(invoice_id):
     conn = get_db()
