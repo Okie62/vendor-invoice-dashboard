@@ -222,6 +222,112 @@ def download_pdf(invoice_id):
     )
 
 
+@app.route("/api/invoices/<invoice_id>/raw-text")
+def get_raw_text(invoice_id):
+    """Return the raw text extracted from the PDF, for debugging parser output."""
+    import pymupdf
+    conn = get_db()
+    inv = conn.execute(
+        "SELECT pdf_path FROM invoices WHERE id = ?", (invoice_id,)
+    ).fetchone()
+    conn.close()
+    if not inv or not inv["pdf_path"]:
+        abort(404)
+    pdf_path = Path(inv["pdf_path"])
+    if not pdf_path.exists():
+        abort(404)
+    try:
+        doc = pymupdf.open(str(pdf_path))
+        full_text = ""
+        for page in doc:
+            full_text += page.get_text() + "\n"
+        doc.close()
+        return jsonify({"text": full_text, "page_count": full_text.count("\n---PAGE---\n") + 1})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/invoices/<invoice_id>", methods=["PUT"])
+def update_invoice(invoice_id):
+    """Update invoice fields, customers, and line items.
+
+    Accepts JSON:
+    {
+      "invoice": { "billing_period": "...", "new_charges": ..., ... },
+      "customers": [{ "id": 1, "name": "...", "account_id": "...", "partner_id": "...", "total": ... }, ...],
+      "line_items": [{ "id": 1, "customer_name": "...", "date": "...", "item": "...", "type": "...", "qty": ..., "unit_price": ..., "amount": ... }, ...]
+    }
+    Any of the three keys may be omitted to skip updating that section.
+    """
+    data = request.get_json()
+    if not data:
+        return jsonify({"error": "No data provided"}), 400
+
+    conn = get_db()
+
+    # Verify invoice exists
+    inv = conn.execute("SELECT id FROM invoices WHERE id = ?", (invoice_id,)).fetchone()
+    if not inv:
+        conn.close()
+        abort(404)
+
+    # Update invoice fields
+    if "invoice" in data:
+        inv_data = data["invoice"]
+        allowed_fields = {
+            "billing_period", "is_credit_memo", "references_invoice",
+            "partner_name", "partner_id", "partner_username",
+            "previous_balance", "credit_card_surcharges",
+            "payment_received", "new_charges", "outstanding_balance"
+        }
+        sets = []
+        values = []
+        for field in allowed_fields:
+            if field in inv_data:
+                val = inv_data[field]
+                if field == "is_credit_memo":
+                    val = 1 if val else 0
+                sets.append(f"{field} = ?")
+                values.append(val)
+        if sets:
+            values.append(invoice_id)
+            conn.execute(
+                f"UPDATE invoices SET {', '.join(sets)} WHERE id = ?",
+                values
+            )
+            conn.commit()
+
+    # Update customers (replace all if provided)
+    if "customers" in data:
+        conn.execute("DELETE FROM customers WHERE invoice_id = ?", (invoice_id,))
+        for c in data["customers"]:
+            conn.execute(
+                "INSERT INTO customers (invoice_id, name, account_id, partner_id, total) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (invoice_id, c.get("name", ""), c.get("account_id", ""),
+                 c.get("partner_id", ""), c.get("total", 0))
+            )
+        conn.commit()
+
+    # Update line items (replace all if provided)
+    if "line_items" in data:
+        conn.execute("DELETE FROM line_items WHERE invoice_id = ?", (invoice_id,))
+        for li in data["line_items"]:
+            conn.execute(
+                "INSERT INTO line_items "
+                "(invoice_id, customer_name, date, item, type, qty, unit_price, amount) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (invoice_id, li.get("customer_name", ""), li.get("date", ""),
+                 li.get("item", ""), li.get("type", ""), li.get("qty", 0),
+                 li.get("unit_price", 0), li.get("amount", 0))
+            )
+        conn.commit()
+
+    conn.close()
+    logging.info(f"Updated invoice {invoice_id} via PUT")
+    return jsonify({"success": True})
+
+
 if __name__ == "__main__":
     init_db()
     port = int(os.environ.get("PORT", 8080))
