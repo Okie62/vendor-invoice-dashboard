@@ -170,14 +170,15 @@ def trigger_poll():
     try:
         if request.args.get("reprocess") in ("true", "1", "yes"):
             conn = get_db()
-            conn.execute("DELETE FROM processed_emails")
-            conn.execute("DELETE FROM invoices")
-            conn.execute("DELETE FROM customers")
+            # Order matters: children first, then parents
             conn.execute("DELETE FROM line_items")
+            conn.execute("DELETE FROM customers")
+            conn.execute("DELETE FROM invoices")
+            conn.execute("DELETE FROM processed_emails")
             conn.execute("DELETE FROM vendors")
             conn.commit()
             conn.close()
-            logging.info("Cleared all processed_emails and invoice data for reprocessing")
+            logging.info("Cleared all data for reprocessing")
         count = run_ingestion()
         return jsonify({"success": True, "processed": count})
     except Exception as e:

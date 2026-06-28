@@ -5,9 +5,9 @@ Tables: vendors, invoices, customers, line_items, processed_emails
 """
 
 import sqlite3
-from pathlib import Path
+from config import DATA_DIR
 
-DB_PATH = Path(__file__).parent.parent / "data" / "db" / "invoices.db"
+DB_PATH = DATA_DIR / "db" / "invoices.db"
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS vendors (
