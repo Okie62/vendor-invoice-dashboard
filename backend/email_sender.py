@@ -215,7 +215,7 @@ def extract_reply_address(from_header: str) -> str:
         email@domain.com
     """
     name, addr = email.utils.parseaddr(from_header)
-    if addr:
+    if addr and "@" in addr:
         return addr
 
     # Fallback: bare email regex
