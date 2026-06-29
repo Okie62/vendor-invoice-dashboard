@@ -18,6 +18,7 @@ from pathlib import Path
 from config import INVOICE_DIR
 from db import get_db, init_db
 from email_poller import connect_imap, fetch_unseen_emails, mark_seen
+from email_sender import send_reply, extract_reply_address
 from pdf_parser import parse_pdf, ParsedInvoice
 from vendor_extractor import extract_vendor
 
@@ -81,6 +82,7 @@ def process_email(conn, email_data: dict):
     vendor_id = ensure_vendor(conn, vendor_name, email_data["from"])
 
     # Process each PDF attachment
+    parsed_invoices = []  # track for reply
     for att in email_data["attachments"]:
         # Save PDF to filesystem
         pdf_dir = INVOICE_DIR / vendor_name
@@ -102,6 +104,26 @@ def process_email(conn, email_data: dict):
             conn, vendor_id, parsed, str(pdf_path),
             email_data["message_id"], source="email"
         )
+        parsed_invoices.append(parsed)
+
+    # Send confirmation reply
+    if parsed_invoices:
+        reply_addr = extract_reply_address(email_data.get("from", ""))
+        if reply_addr:
+            # Use first parsed invoice for the reply summary
+            p = parsed_invoices[0]
+            send_reply(
+                to_addr=reply_addr,
+                original_subject=email_data.get("subject", ""),
+                invoice_id=p.invoice_id,
+                vendor=vendor_name,
+                amount=p.outstanding_balance or p.new_charges,
+                billing_period=p.billing_period,
+                received_date=email_data.get("received_date", ""),
+                attachment_count=len(email_data["attachments"]),
+            )
+        else:
+            log.warning("No reply address found in From header — skipping reply")
 
     # Log to processed_emails
     conn.execute(

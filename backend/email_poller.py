@@ -11,6 +11,7 @@ OAuth, confirmation flow, and reply sending.
 
 import email
 import email.header
+import email.utils
 import imaplib
 import logging
 import re
@@ -65,6 +66,7 @@ def fetch_unseen_emails(imap: imaplib.IMAP4_SSL) -> list:
         message_id = msg.get("Message-ID", "").strip()
         subject = _decode_header(msg.get("Subject", ""))
         from_header = _decode_header(msg.get("From", ""))
+        date_header = msg.get("Date", "")
         body_text = _get_plain_text(msg)
         attachments = _extract_attachments(msg)
 
@@ -78,6 +80,7 @@ def fetch_unseen_emails(imap: imaplib.IMAP4_SSL) -> list:
             "message_id": message_id,
             "subject": subject,
             "from": from_header,
+            "received_date": _format_date(date_header),
             "body_text": body_text,
             "attachments": attachments,
         })
@@ -146,3 +149,18 @@ def _get_plain_text(msg) -> str:
     if html_body:
         return re.sub(r"<[^>]+>", " ", html_body)
     return ""
+
+
+def _format_date(date_header: str) -> str:
+    """Format an RFC 2822 Date header into a human-readable string.
+
+    e.g. 'Sun, 28 Jun 2026 11:25:39 +0000' -> 'Jun 28, 2026, 04:25 AM PDT'
+    Falls back to the raw header if parsing fails.
+    """
+    if not date_header:
+        return ""
+    try:
+        dt = email.utils.parsedate_to_datetime(date_header)
+        return dt.strftime("%b %d, %Y, %I:%M %p %Z").strip()
+    except Exception:
+        return date_header
