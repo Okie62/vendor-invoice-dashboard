@@ -147,7 +147,11 @@
     <h1>Vendor Invoice Dashboard</h1>
     <div class="subtitle">Oklahoma Technology Solutions · Partner ID 36024</div>
   </div>
-  <div class="vendor-badge" id="vendorBadge">All Vendors</div>
+  <div style="display:flex; align-items:center; gap:12px">
+    <span id="userBadge" style="color:var(--text-dim); font-size:13px;"></span>
+    <button onclick="logout()" style="background:var(--border); color:var(--text); border:none; padding:8px 16px; border-radius:8px; cursor:pointer; font-size:13px; font-weight:600;">Logout</button>
+    <div class="vendor-badge" id="vendorBadge">All Vendors</div>
+  </div>
 </div>
 
 <!-- Filter Bar -->
@@ -230,7 +234,7 @@
     <div class="modal-header">
       <h2 id="modalTitle">Invoice Detail</h2>
       <div style="display:flex; gap:8px; align-items:center">
-        <a href="#" id="downloadPdfBtn" class="btn-download" download>📄 Download PDF</a>
+        <a href="#" id="downloadPdfBtn" class="btn-download" onclick="downloadPdf(event); return false;">📄 Download PDF</a>
         <button class="modal-close" onclick="closeDetailModal()">✕</button>
       </div>
     </div>
@@ -277,21 +281,87 @@ let lineSort = {col: 'customer', dir: 'asc'};
 let customerChart = null;
 let categoryChart = null;
 
+// --- Auth helpers ---
+function getAccessToken() { return localStorage.getItem('access_token') || ''; }
+function getRefreshToken() { return localStorage.getItem('refresh_token') || ''; }
+function getUser() { try { return JSON.parse(localStorage.getItem('user') || '{}'); } catch(e) { return {}; } }
+
+function authHeaders(extra = {}) {
+  const token = getAccessToken();
+  return token ? { 'Authorization': `Bearer ${token}`, ...extra } : extra;
+}
+
+let isRefreshing = false;
+
+async function authFetch(url, options = {}) {
+  const token = getAccessToken();
+  const headers = { ...(options.headers || {}), ...(token ? { 'Authorization': `Bearer ${token}` } : {}) };
+  const res = await fetch(url, { ...options, headers });
+
+  if (res.status === 401 && !isRefreshing) {
+    // Try to refresh the token
+    isRefreshing = true;
+    const refreshed = await tryRefresh();
+    isRefreshing = false;
+    if (refreshed) {
+      // Retry with new token
+      const newToken = getAccessToken();
+      const newHeaders = { ...(options.headers || {}), ...(newToken ? { 'Authorization': `Bearer ${newToken}` } : {}) };
+      return fetch(url, { ...options, headers: newHeaders });
+    }
+    // Refresh failed — redirect to login
+    window.location.href = '/login.html';
+    return res;
+  }
+  return res;
+}
+
+async function tryRefresh() {
+  const refreshToken = getRefreshToken();
+  if (!refreshToken) return false;
+  try {
+    const res = await fetch('/api/auth/refresh', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ refresh_token: refreshToken }),
+    });
+    if (res.ok) {
+      const data = await res.json();
+      localStorage.setItem('access_token', data.access_token);
+      localStorage.setItem('refresh_token', data.refresh_token);
+      return true;
+    }
+  } catch(e) {}
+  return false;
+}
+
+function logout() {
+  localStorage.removeItem('access_token');
+  localStorage.removeItem('refresh_token');
+  localStorage.removeItem('user');
+  window.location.href = '/login.html';
+}
+
+// --- Check auth on page load ---
+if (!getAccessToken()) {
+  window.location.href = '/login.html';
+}
+
 // --- API data loading ---
 async function loadData() {
   // Fetch vendors
-  const vendorRes = await fetch('/api/vendors');
+  const vendorRes = await authFetch('/api/vendors');
   VENDORS = await vendorRes.json();
 
   // Fetch invoices (optionally filtered by vendor)
   const url = selectedVendor ? `/api/invoices?vendor=${encodeURIComponent(selectedVendor)}` : '/api/invoices';
-  const invRes = await fetch(url);
+  const invRes = await authFetch(url);
   const invoiceList = await invRes.json();
 
   // Fetch detail (customers + line items) for each invoice
   INVOICES = [];
   for (const inv of invoiceList) {
-    const detailRes = await fetch(`/api/invoices/${inv.id}`);
+    const detailRes = await authFetch(`/api/invoices/${inv.id}`);
     const detail = await detailRes.json();
     INVOICES.push({
       id: inv.id,
@@ -321,6 +391,9 @@ async function loadData() {
 
   selectedInvoices.clear();
   INVOICES.forEach(inv => selectedInvoices.add(inv.id));
+  // Set user badge
+  const user = getUser();
+  document.getElementById('userBadge').textContent = user.full_name || user.email || '';
   renderVendors();
   renderAll();
 }
@@ -334,7 +407,7 @@ function renderVendors() {
 
 // --- Delete invoice (API-backed) ---
 async function deleteInvoice(invoiceId) {
-  await fetch(`/api/invoices/${invoiceId}`, { method: 'DELETE' });
+  await authFetch(`/api/invoices/${invoiceId}`, { method: 'DELETE' });
   const idx = INVOICES.findIndex(i => i.id === invoiceId);
   if (idx !== -1) INVOICES.splice(idx, 1);
   selectedInvoices.delete(invoiceId);
@@ -612,7 +685,7 @@ async function handleFileUpload(files) {
     formData.append('file', file);
     formData.append('vendor', selectedVendor || 'Unknown');
     try {
-      const res = await fetch('/api/upload', { method: 'POST', body: formData });
+      const res = await authFetch('/api/upload', { method: 'POST', body: formData });
       const result = await res.json();
       if (res.ok) {
         success++;
@@ -703,7 +776,7 @@ async function openDetailModal(invoiceId) {
   document.getElementById('modalTitle').textContent = `Invoice #${invoiceId} — ${inv.vendor}`;
 
   // Set download link
-  document.getElementById('downloadPdfBtn').href = `/api/invoices/${invoiceId}/pdf`;
+  // (downloadPdf function handles the actual download with auth)
 
   // Load PDF
   document.getElementById('pdfPane').innerHTML = '<div class="pdf-loading">Loading PDF...</div>';
@@ -738,7 +811,12 @@ function switchTab(tab) {
 async function renderPdf(invoiceId) {
   const pane = document.getElementById('pdfPane');
   try {
-    const loadingTask = window.pdfjsLib.getDocument(`/api/invoices/${invoiceId}/pdf`);
+    // Fetch PDF as blob with auth headers, then pass to PDF.js
+    const pdfRes = await authFetch(`/api/invoices/${invoiceId}/pdf`);
+    if (!pdfRes.ok) throw new Error(`HTTP ${pdfRes.status}`);
+    const pdfBlob = await pdfRes.blob();
+    const pdfUrl = URL.createObjectURL(pdfBlob);
+    const loadingTask = window.pdfjsLib.getDocument(pdfUrl);
     const pdf = await loadingTask.promise;
     pane.innerHTML = '';
     for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
@@ -856,7 +934,7 @@ function addLineItemRow() {
 // --- Raw Text ---
 async function loadRawText(invoiceId) {
   try {
-    const res = await fetch(`/api/invoices/${invoiceId}/raw-text`);
+    const res = await authFetch(`/api/invoices/${invoiceId}/raw-text`);
     const data = await res.json();
     modalRawText = data.text || '(no text extracted)';
     document.getElementById('rawTextContent').textContent = modalRawText;
@@ -913,7 +991,7 @@ async function saveInvoiceChanges() {
   });
 
   try {
-    const res = await fetch(`/api/invoices/${modalInvoiceId}`, {
+    const res = await authFetch(`/api/invoices/${modalInvoiceId}`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ invoice: invoiceData, customers, line_items: lineItems }),
@@ -938,6 +1016,26 @@ async function saveInvoiceChanges() {
 function val(id) { const el = document.getElementById(id); return el ? el.value : ''; }
 function numVal(id) { const v = val(id); return v ? parseFloat(v) : 0; }
 function esc(s) { const d = document.createElement('div'); d.textContent = s || ''; return d.innerHTML; }
+
+// --- Download PDF with auth ---
+async function downloadPdf(e) {
+  if (!modalInvoiceId) return;
+  try {
+    const res = await authFetch(`/api/invoices/${modalInvoiceId}/pdf`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${modalInvoiceId}.pdf`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  } catch(err) {
+    alert('Failed to download PDF: ' + err.message);
+  }
+}
 
 // Close modal on overlay click
 document.getElementById('detailModal').addEventListener('click', e => {

@@ -10,12 +10,18 @@ import logging
 import os
 from pathlib import Path
 
-from flask import Flask, jsonify, request, send_from_directory, abort
+from flask import Flask, jsonify, request, send_from_directory, abort, g
 
 from db import init_db, get_db
 from pdf_parser import parse_pdf
 from ingest import ensure_vendor, store_invoice
 from config import DATA_DIR, INVOICE_DIR, DB_PATH
+from auth import (
+    get_password_hash, verify_password, validate_password_strength,
+    create_access_token, create_refresh_token,
+    decode_access_token, decode_refresh_token,
+    extract_token_from_request, require_auth,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -41,10 +47,179 @@ def index():
 
 
 # ---------------------------------------------------------------------------
+# Auth API routes (public — no token required)
+# ---------------------------------------------------------------------------
+
+@app.route("/api/auth/login", methods=["POST"])
+def login():
+    """OAuth2-compatible login. Returns JWT access + refresh tokens."""
+    data = request.get_json() or {}
+    email = data.get("email", "").strip().lower()
+    password = data.get("password", "")
+
+    if not email or not password:
+        return jsonify({"error": "Email and password required"}), 400
+
+    conn = get_db()
+    user = conn.execute(
+        "SELECT * FROM users WHERE email = ?", (email,)
+    ).fetchone()
+    conn.close()
+
+    if not user or not verify_password(password, user["hashed_password"]):
+        return jsonify({"error": "Incorrect email or password"}), 401
+
+    if not user["is_active"]:
+        return jsonify({"error": "Inactive user"}), 403
+
+    access_token = create_access_token(user["id"])
+    refresh_token = create_refresh_token(user["id"])
+
+    return jsonify({
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "token_type": "bearer",
+        "user": {
+            "id": user["id"],
+            "email": user["email"],
+            "full_name": user["full_name"],
+            "is_admin": bool(user["is_admin"]),
+        }
+    })
+
+
+@app.route("/api/auth/register", methods=["POST"])
+def register():
+    """Register a new user. First user becomes admin."""
+    data = request.get_json() or {}
+    email = data.get("email", "").strip().lower()
+    password = data.get("password", "")
+    full_name = data.get("full_name", "")
+
+    if not email or not password or not full_name:
+        return jsonify({"error": "Email, password, and full name required"}), 400
+
+    err = validate_password_strength(password)
+    if err:
+        return jsonify({"error": err}), 400
+
+    conn = get_db()
+    existing = conn.execute(
+        "SELECT 1 FROM users WHERE email = ?", (email,)
+    ).fetchone()
+    if existing:
+        conn.close()
+        return jsonify({"error": "Email already registered"}), 400
+
+    # First user becomes admin
+    user_count = conn.execute("SELECT COUNT(*) as count FROM users").fetchone()["count"]
+    is_admin = 1 if user_count == 0 else 0
+
+    cursor = conn.execute(
+        "INSERT INTO users (email, hashed_password, full_name, is_admin) "
+        "VALUES (?, ?, ?, ?)",
+        (email, get_password_hash(password), full_name, is_admin)
+    )
+    conn.commit()
+    user_id = cursor.lastrowid
+    conn.close()
+
+    access_token = create_access_token(user_id)
+    refresh_token = create_refresh_token(user_id)
+
+    return jsonify({
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "token_type": "bearer",
+        "user": {
+            "id": user_id,
+            "email": email,
+            "full_name": full_name,
+            "is_admin": bool(is_admin),
+        }
+    }), 201
+
+
+@app.route("/api/auth/refresh", methods=["POST"])
+def refresh():
+    """Exchange a refresh token for a new access + refresh token pair."""
+    data = request.get_json() or {}
+    refresh_token = data.get("refresh_token", "")
+
+    if not refresh_token:
+        return jsonify({"error": "Refresh token required"}), 400
+
+    payload = decode_refresh_token(refresh_token)
+    if payload is None:
+        return jsonify({"error": "Invalid or expired refresh token"}), 401
+
+    try:
+        user_id = int(payload["sub"])
+    except (KeyError, ValueError):
+        return jsonify({"error": "Invalid token payload"}), 401
+
+    conn = get_db()
+    user = conn.execute(
+        "SELECT id, is_active FROM users WHERE id = ?", (user_id,)
+    ).fetchone()
+    conn.close()
+
+    if not user or not user["is_active"]:
+        return jsonify({"error": "Invalid or expired refresh token"}), 401
+
+    return jsonify({
+        "access_token": create_access_token(user_id),
+        "refresh_token": create_refresh_token(user_id),
+        "token_type": "bearer",
+    })
+
+
+@app.route("/api/auth/me")
+@require_auth
+def get_current_user():
+    """Get current authenticated user info."""
+    conn = get_db()
+    user = conn.execute(
+        "SELECT id, email, full_name, is_active, is_admin, created_at "
+        "FROM users WHERE id = ?",
+        (g.current_user_id,)
+    ).fetchone()
+    conn.close()
+
+    if not user:
+        return jsonify({"error": "User not found"}), 404
+
+    return jsonify({
+        "id": user["id"],
+        "email": user["email"],
+        "full_name": user["full_name"],
+        "is_active": bool(user["is_active"]),
+        "is_admin": bool(user["is_admin"]),
+        "created_at": user["created_at"],
+    })
+
+
+@app.route("/api/auth/setup-check")
+def setup_check():
+    """Check if any users exist. Frontend uses this to show register vs login."""
+    conn = get_db()
+    count = conn.execute("SELECT COUNT(*) as count FROM users").fetchone()["count"]
+    conn.close()
+    return jsonify({"has_users": count > 0})
+
+
+@app.route("/api/health")
+def health_check():
+    """Lightweight health check for Render."""
+    return jsonify({"status": "healthy"})
+
+
+# ---------------------------------------------------------------------------
 # API routes
 # ---------------------------------------------------------------------------
 
 @app.route("/api/vendors")
+@require_auth
 def get_vendors():
     conn = get_db()
     rows = conn.execute(
@@ -55,6 +230,7 @@ def get_vendors():
 
 
 @app.route("/api/invoices")
+@require_auth
 def get_invoices():
     conn = get_db()
     vendor = request.args.get("vendor")
@@ -76,6 +252,7 @@ def get_invoices():
 
 
 @app.route("/api/invoices/<invoice_id>")
+@require_auth
 def get_invoice(invoice_id):
     conn = get_db()
     inv = conn.execute(
@@ -101,6 +278,7 @@ def get_invoice(invoice_id):
 
 
 @app.route("/api/summary")
+@require_auth
 def get_summary():
     """Aggregated summary across all or filtered invoices."""
     conn = get_db()
@@ -131,6 +309,7 @@ def get_summary():
 
 
 @app.route("/api/upload", methods=["POST"])
+@require_auth
 def upload_pdf():
     if "file" not in request.files:
         return jsonify({"error": "No file provided"}), 400
@@ -158,6 +337,7 @@ def upload_pdf():
 
 
 @app.route("/api/poll", methods=["POST"])
+@require_auth
 def trigger_poll():
     """Manually trigger an email poll cycle.
 
@@ -186,6 +366,7 @@ def trigger_poll():
 
 
 @app.route("/api/invoices/<invoice_id>", methods=["DELETE"])
+@require_auth
 def delete_invoice(invoice_id):
     conn = get_db()
     inv = conn.execute(
@@ -206,6 +387,7 @@ def delete_invoice(invoice_id):
 
 
 @app.route("/api/invoices/<invoice_id>/pdf")
+@require_auth
 def download_pdf(invoice_id):
     conn = get_db()
     inv = conn.execute(
@@ -223,6 +405,7 @@ def download_pdf(invoice_id):
 
 
 @app.route("/api/invoices/<invoice_id>/raw-text")
+@require_auth
 def get_raw_text(invoice_id):
     """Return the raw text extracted from the PDF, for debugging parser output."""
     import pymupdf
@@ -248,6 +431,7 @@ def get_raw_text(invoice_id):
 
 
 @app.route("/api/invoices/<invoice_id>", methods=["PUT"])
+@require_auth
 def update_invoice(invoice_id):
     """Update invoice fields, customers, and line items.
 
