@@ -239,6 +239,46 @@ def health_check():
     return jsonify({"status": "healthy"})
 
 
+@app.route("/api/diagnostic")
+def diagnostic():
+    """Diagnostic endpoint to debug data loss issues (temporarily public)."""
+    import sys
+    from config import BASE_DIR, DATA_DIR, DB_PATH
+
+    db_exists = DB_PATH.exists()
+    db_size = DB_PATH.stat().st_size if db_exists else 0
+
+    conn = get_db()
+    table_count = conn.execute(
+        "SELECT count(*) as c FROM sqlite_master WHERE type='table'"
+    ).fetchone()["c"]
+    invoice_count = 0
+    user_count = 0
+    try:
+        invoice_count = conn.execute("SELECT count(*) as c FROM invoices").fetchone()["c"]
+    except Exception:
+        pass
+    try:
+        user_count = conn.execute("SELECT count(*) as c FROM users").fetchone()["c"]
+    except Exception:
+        pass
+    conn.close()
+
+    return jsonify({
+        "base_dir": str(BASE_DIR),
+        "data_dir": str(DATA_DIR),
+        "db_path": str(DB_PATH),
+        "db_exists": db_exists,
+        "db_size_bytes": db_size,
+        "render_project_dir": os.environ.get("RENDER_PROJECT_DIR", "NOT SET"),
+        "python_version": sys.version,
+        "table_count": table_count,
+        "invoice_count": invoice_count,
+        "user_count": user_count,
+        "disk_mount_check": Path("/opt/render/project/src/data").exists(),
+    })
+
+
 # ---------------------------------------------------------------------------
 # API routes
 # ---------------------------------------------------------------------------
