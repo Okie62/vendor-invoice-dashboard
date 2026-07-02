@@ -30,6 +30,31 @@ logging.basicConfig(
 
 app = Flask(__name__, static_folder="../frontend", static_url_path="")
 
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _resolve_pdf_path(stored_path):
+    """Resolve a PDF path that may be relative to DATA_DIR (#26).
+
+    Old invoices stored absolute paths; new ones store relative to DATA_DIR.
+    This handles both cases.
+    """
+    if not stored_path:
+        return None
+    p = Path(stored_path)
+    if p.is_absolute() and p.exists():
+        return p
+    # Try resolving relative to DATA_DIR
+    from config import DATA_DIR
+    rel = DATA_DIR / stored_path
+    if rel.exists():
+        return rel
+    # Last resort: return the original path
+    return p
+
+
 # Initialize database on startup (works with gunicorn, not just __main__)
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 INVOICE_DIR.mkdir(parents=True, exist_ok=True)
@@ -72,7 +97,7 @@ def login():
     if not user["is_active"]:
         return jsonify({"error": "Inactive user"}), 403
 
-    access_token = create_access_token(user["id"])
+    access_token = create_access_token(user["id"], email=user["email"])
     refresh_token = create_refresh_token(user["id"])
 
     return jsonify({
@@ -124,7 +149,7 @@ def register():
     user_id = cursor.lastrowid
     conn.close()
 
-    access_token = create_access_token(user_id)
+    access_token = create_access_token(user_id, email=email)
     refresh_token = create_refresh_token(user_id)
 
     return jsonify({
@@ -232,23 +257,133 @@ def get_vendors():
 @app.route("/api/invoices")
 @require_auth
 def get_invoices():
+    """Get invoices with optional vendor and date filtering (#7).
+
+    Query params:
+      vendor — filter by vendor name
+      start  — billing_period >= start (ISO date or 'Mon DD, YYYY')
+      end    — billing_period <= end
+      search — search invoice_id or billing_period (#29)
+    """
     conn = get_db()
     vendor = request.args.get("vendor")
+    start_date = request.args.get("start")
+    end_date = request.args.get("end")
+    search = request.args.get("search", "").strip()
+
+    query = (
+        "SELECT i.*, v.name as vendor_name FROM invoices i "
+        "JOIN vendors v ON i.vendor_id = v.id WHERE 1=1"
+    )
+    params = []
     if vendor:
-        rows = conn.execute(
-            "SELECT i.*, v.name as vendor_name FROM invoices i "
-            "JOIN vendors v ON i.vendor_id = v.id "
-            "WHERE v.name = ? ORDER BY i.created_at DESC",
-            (vendor,)
-        ).fetchall()
-    else:
-        rows = conn.execute(
-            "SELECT i.*, v.name as vendor_name FROM invoices i "
-            "JOIN vendors v ON i.vendor_id = v.id "
-            "ORDER BY i.created_at DESC"
-        ).fetchall()
+        query += " AND v.name = ?"
+        params.append(vendor)
+    if start_date:
+        query += " AND i.created_at >= ?"
+        params.append(start_date)
+    if end_date:
+        query += " AND i.created_at <= ?"
+        params.append(end_date)
+    if search:
+        query += " AND (i.id LIKE ? OR i.billing_period LIKE ?)"
+        params.extend([f"%{search}%", f"%{search}%"])
+    query += " ORDER BY i.created_at DESC"
+
+    rows = conn.execute(query, params).fetchall()
     conn.close()
     return jsonify([dict(r) for r in rows])
+
+
+@app.route("/api/invoices/bulk")
+@require_auth
+def get_invoices_bulk():
+    """Bulk endpoint returning invoices with customers and line items (#2).
+
+    Replaces the N+1 pattern of calling /api/invoices/{id} in a loop.
+    Supports the same vendor/start/end/search filters as /api/invoices.
+    """
+    conn = get_db()
+    vendor = request.args.get("vendor")
+    start_date = request.args.get("start")
+    end_date = request.args.get("end")
+    search = request.args.get("search", "").strip()
+
+    query = (
+        "SELECT i.*, v.name as vendor_name FROM invoices i "
+        "JOIN vendors v ON i.vendor_id = v.id WHERE 1=1"
+    )
+    params = []
+    if vendor:
+        query += " AND v.name = ?"
+        params.append(vendor)
+    if start_date:
+        query += " AND i.created_at >= ?"
+        params.append(start_date)
+    if end_date:
+        query += " AND i.created_at <= ?"
+        params.append(end_date)
+    if search:
+        query += " AND (i.id LIKE ? OR i.billing_period LIKE ?)"
+        params.extend([f"%{search}%", f"%{search}%"])
+    query += " ORDER BY i.created_at DESC"
+
+    rows = conn.execute(query, params).fetchall()
+    if not rows:
+        conn.close()
+        return jsonify({"invoices": []})
+
+    inv_ids = [r["id"] for r in rows]
+
+    # Fetch all customers for these invoices in one query
+    placeholders = ",".join("?" * len(inv_ids))
+    customers = conn.execute(
+        f"SELECT * FROM customers WHERE invoice_id IN ({placeholders})",
+        inv_ids
+    ).fetchall()
+
+    # Fetch all line items in one query
+    line_items = conn.execute(
+        f"SELECT * FROM line_items WHERE invoice_id IN ({placeholders})",
+        inv_ids
+    ).fetchall()
+
+    conn.close()
+
+    # Group by invoice_id
+    cust_map = {}
+    for c in customers:
+        cust_map.setdefault(c["invoice_id"], []).append(dict(c))
+    li_map = {}
+    for li in line_items:
+        li_map.setdefault(li["invoice_id"], []).append(dict(li))
+
+    result = []
+    for r in rows:
+        inv = dict(r)
+        inv_id = inv["id"]
+        result.append({
+            "id": inv_id,
+            "vendor": inv.get("vendor_name", ""),
+            "billing_period": inv.get("billing_period", ""),
+            "invoice_date": inv.get("invoice_date", ""),
+            "is_credit_memo": bool(inv.get("is_credit_memo", 0)),
+            "references_invoice": inv.get("references_invoice"),
+            "partner_name": inv.get("partner_name", ""),
+            "partner_id": inv.get("partner_id", ""),
+            "partner_username": inv.get("partner_username", ""),
+            "summary": {
+                "previous_balance": inv.get("previous_balance", 0),
+                "credit_card_surcharges": inv.get("credit_card_surcharges", 0),
+                "payment_received": inv.get("payment_received", 0),
+                "new_charges": inv.get("new_charges", 0),
+                "outstanding_balance": inv.get("outstanding_balance", 0),
+            },
+            "customers": cust_map.get(inv_id, []),
+            "line_items": li_map.get(inv_id, []),
+        })
+
+    return jsonify({"invoices": result})
 
 
 @app.route("/api/invoices/<invoice_id>")
@@ -280,30 +415,38 @@ def get_invoice(invoice_id):
 @app.route("/api/summary")
 @require_auth
 def get_summary():
-    """Aggregated summary across all or filtered invoices."""
+    """Aggregated summary across all or filtered invoices.
+
+    Supports vendor and date filtering (#7).
+    Returns CC surcharges in summary (#16).
+    """
     conn = get_db()
     vendor = request.args.get("vendor")
+    start_date = request.args.get("start")
+    end_date = request.args.get("end")
+
+    where = "WHERE 1=1"
+    params = []
     if vendor:
-        row = conn.execute(
-            "SELECT SUM(previous_balance) as prev, "
-            "SUM(credit_card_surcharges) as cc, "
-            "SUM(payment_received) as pay, "
-            "SUM(new_charges) as new, "
-            "SUM(outstanding_balance) as outstanding, "
-            "COUNT(*) as count "
-            "FROM invoices i JOIN vendors v ON i.vendor_id = v.id "
-            "WHERE v.name = ?",
-            (vendor,)
-        ).fetchone()
-    else:
-        row = conn.execute(
-            "SELECT SUM(previous_balance) as prev, "
-            "SUM(credit_card_surcharges) as cc, "
-            "SUM(payment_received) as pay, "
-            "SUM(new_charges) as new, "
-            "SUM(outstanding_balance) as outstanding, "
-            "COUNT(*) as count FROM invoices"
-        ).fetchone()
+        where += " AND v.name = ?"
+        params.append(vendor)
+    if start_date:
+        where += " AND i.created_at >= ?"
+        params.append(start_date)
+    if end_date:
+        where += " AND i.created_at <= ?"
+        params.append(end_date)
+
+    row = conn.execute(
+        f"SELECT SUM(i.previous_balance) as prev, "
+        f"SUM(i.credit_card_surcharges) as cc, "
+        f"SUM(i.payment_received) as pay, "
+        f"SUM(i.new_charges) as new, "
+        f"SUM(i.outstanding_balance) as outstanding, "
+        f"COUNT(*) as count "
+        f"FROM invoices i JOIN vendors v ON i.vendor_id = v.id {where}",
+        params
+    ).fetchone()
     conn.close()
     return jsonify(dict(row) if row else {})
 
@@ -380,8 +523,8 @@ def delete_invoice(invoice_id):
     conn.close()
     # Delete the PDF file if it exists
     if inv["pdf_path"]:
-        pdf = Path(inv["pdf_path"])
-        if pdf.exists():
+        pdf = _resolve_pdf_path(inv["pdf_path"])
+        if pdf and pdf.exists():
             pdf.unlink()
     return jsonify({"success": True})
 
@@ -396,11 +539,11 @@ def download_pdf(invoice_id):
     conn.close()
     if not inv or not inv["pdf_path"]:
         abort(404)
-    pdf_path = Path(inv["pdf_path"])
-    if not pdf_path.exists():
+    pdf_path = _resolve_pdf_path(inv["pdf_path"])
+    if not pdf_path or not pdf_path.exists():
         abort(404)
     return send_from_directory(
-        pdf_path.parent, pdf_path.name, as_attachment=True
+        str(pdf_path.parent), pdf_path.name, as_attachment=True
     )
 
 
@@ -416,8 +559,8 @@ def get_raw_text(invoice_id):
     conn.close()
     if not inv or not inv["pdf_path"]:
         abort(404)
-    pdf_path = Path(inv["pdf_path"])
-    if not pdf_path.exists():
+    pdf_path = _resolve_pdf_path(inv["pdf_path"])
+    if not pdf_path or not pdf_path.exists():
         abort(404)
     try:
         doc = pymupdf.open(str(pdf_path))
@@ -459,13 +602,14 @@ def update_invoice(invoice_id):
     if "invoice" in data:
         inv_data = data["invoice"]
         allowed_fields = {
-            "billing_period", "is_credit_memo", "references_invoice",
+            "billing_period", "invoice_date", "is_credit_memo", "references_invoice",
             "partner_name", "partner_id", "partner_username",
             "previous_balance", "credit_card_surcharges",
             "payment_received", "new_charges", "outstanding_balance"
         }
         sets = []
         values = []
+        changes = {}
         for field in allowed_fields:
             if field in inv_data:
                 val = inv_data[field]
@@ -473,6 +617,7 @@ def update_invoice(invoice_id):
                     val = 1 if val else 0
                 sets.append(f"{field} = ?")
                 values.append(val)
+                changes[field] = val
         if sets:
             values.append(invoice_id)
             conn.execute(
@@ -480,6 +625,13 @@ def update_invoice(invoice_id):
                 values
             )
             conn.commit()
+            # Audit log (#20)
+            from db import log_audit
+            user_email = ""
+            if hasattr(g, 'current_user_email'):
+                user_email = g.current_user_email or ""
+            log_audit(conn, invoice_id, g.current_user_id, user_email,
+                      "update_invoice", changes)
 
     # Update customers (replace all if provided)
     if "customers" in data:
@@ -510,6 +662,265 @@ def update_invoice(invoice_id):
     conn.close()
     logging.info(f"Updated invoice {invoice_id} via PUT")
     return jsonify({"success": True})
+
+
+# ---------------------------------------------------------------------------
+# CSV Export (#8)
+# ---------------------------------------------------------------------------
+
+@app.route("/api/export/invoices")
+@require_auth
+def export_invoices_csv():
+    """Export invoices as CSV."""
+    import csv
+    import io
+    conn = get_db()
+    vendor = request.args.get("vendor")
+    if vendor:
+        rows = conn.execute(
+            "SELECT i.id, v.name as vendor, i.billing_period, i.invoice_date, "
+            "i.is_credit_memo, i.previous_balance, i.credit_card_surcharges, "
+            "i.payment_received, i.new_charges, i.outstanding_balance, i.created_at "
+            "FROM invoices i JOIN vendors v ON i.vendor_id = v.id "
+            "WHERE v.name = ? ORDER BY i.created_at DESC",
+            (vendor,)
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT i.id, v.name as vendor, i.billing_period, i.invoice_date, "
+            "i.is_credit_memo, i.previous_balance, i.credit_card_surcharges, "
+            "i.payment_received, i.new_charges, i.outstanding_balance, i.created_at "
+            "FROM invoices i JOIN vendors v ON i.vendor_id = v.id "
+            "ORDER BY i.created_at DESC"
+        ).fetchall()
+    conn.close()
+
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["Invoice ID", "Vendor", "Billing Period", "Invoice Date",
+                     "Credit Memo", "Previous Balance", "CC Surcharges",
+                     "Payment Received", "New Charges", "Outstanding Balance",
+                     "Created At"])
+    for r in rows:
+        writer.writerow(list(r))
+    buf.seek(0)
+    from flask import Response
+    return Response(
+        buf.getvalue(),
+        mimetype="text/csv",
+        headers={"Content-Disposition": "attachment; filename=invoices.csv"}
+    )
+
+
+@app.route("/api/export/customers")
+@require_auth
+def export_customers_csv():
+    """Export customers as CSV."""
+    import csv
+    import io
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT c.name, c.account_id, c.partner_id, c.total, i.id as invoice_id, "
+        "v.name as vendor FROM customers c "
+        "JOIN invoices i ON c.invoice_id = i.id "
+        "JOIN vendors v ON i.vendor_id = v.id "
+        "ORDER BY c.name"
+    ).fetchall()
+    conn.close()
+
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["Customer", "Account ID", "Partner Ref", "Total", "Invoice ID", "Vendor"])
+    for r in rows:
+        writer.writerow(list(r))
+    buf.seek(0)
+    from flask import Response
+    return Response(
+        buf.getvalue(),
+        mimetype="text/csv",
+        headers={"Content-Disposition": "attachment; filename=customers.csv"}
+    )
+
+
+@app.route("/api/export/line-items")
+@require_auth
+def export_line_items_csv():
+    """Export line items as CSV."""
+    import csv
+    import io
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT li.customer_name, li.date, li.item, li.type, li.qty, "
+        "li.unit_price, li.amount, li.invoice_id, v.name as vendor "
+        "FROM line_items li "
+        "JOIN invoices i ON li.invoice_id = i.id "
+        "JOIN vendors v ON i.vendor_id = v.id "
+        "ORDER BY li.date DESC"
+    ).fetchall()
+    conn.close()
+
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["Customer", "Date", "Item", "Type", "Qty", "Unit Price",
+                     "Amount", "Invoice ID", "Vendor"])
+    for r in rows:
+        writer.writerow(list(r))
+    buf.seek(0)
+    from flask import Response
+    return Response(
+        buf.getvalue(),
+        mimetype="text/csv",
+        headers={"Content-Disposition": "attachment; filename=line_items.csv"}
+    )
+
+
+# ---------------------------------------------------------------------------
+# Reprocess single invoice (#15)
+# ---------------------------------------------------------------------------
+
+@app.route("/api/invoices/<invoice_id>/reprocess", methods=["POST"])
+@require_auth
+def reprocess_single_invoice(invoice_id):
+    """Re-parse a single invoice's PDF and update its data (#15).
+
+    Unlike ?reprocess=true which wipes everything, this only re-parses
+    the PDF for the specified invoice and updates its DB record.
+    """
+    conn = get_db()
+    inv = conn.execute(
+        "SELECT pdf_path FROM invoices WHERE id = ?", (invoice_id,)
+    ).fetchone()
+    if not inv:
+        conn.close()
+        abort(404)
+
+    pdf_path = _resolve_pdf_path(inv["pdf_path"])
+    if not pdf_path or not pdf_path.exists():
+        conn.close()
+        return jsonify({"error": "PDF file not found"}), 404
+
+    try:
+        parsed = parse_pdf(str(pdf_path))
+    except ValueError as e:
+        conn.close()
+        return jsonify({"error": str(e)}), 422
+
+    # Get vendor_id from existing invoice
+    vendor_row = conn.execute(
+        "SELECT vendor_id FROM invoices WHERE id = ?", (invoice_id,)
+    ).fetchone()
+    vendor_id = vendor_row["vendor_id"]
+
+    store_invoice(conn, vendor_id, parsed, str(pdf_path), "", source="reprocess")
+    conn.close()
+
+    return jsonify({"success": True, "invoice_id": parsed.invoice_id})
+
+
+# ---------------------------------------------------------------------------
+# Vendor management (#19)
+# ---------------------------------------------------------------------------
+
+@app.route("/api/vendors/<int:vendor_id>", methods=["PUT"])
+@require_auth
+def update_vendor(vendor_id):
+    """Update a vendor's name or email_domain (#19)."""
+    data = request.get_json() or {}
+    conn = get_db()
+    existing = conn.execute(
+        "SELECT id FROM vendors WHERE id = ?", (vendor_id,)
+    ).fetchone()
+    if not existing:
+        conn.close()
+        abort(404)
+
+    sets = []
+    values = []
+    for field in ("name", "email_domain"):
+        if field in data:
+            sets.append(f"{field} = ?")
+            values.append(data[field])
+    if sets:
+        values.append(vendor_id)
+        conn.execute(
+            f"UPDATE vendors SET {', '.join(sets)} WHERE id = ?",
+            values
+        )
+        conn.commit()
+    conn.close()
+    return jsonify({"success": True})
+
+
+@app.route("/api/vendors/<int:vendor_id>", methods=["DELETE"])
+@require_auth
+def delete_vendor(vendor_id):
+    """Delete a vendor if it has no invoices (#19)."""
+    conn = get_db()
+    count = conn.execute(
+        "SELECT COUNT(*) as c FROM invoices WHERE vendor_id = ?", (vendor_id,)
+    ).fetchone()["c"]
+    if count > 0:
+        conn.close()
+        return jsonify({"error": f"Cannot delete vendor with {count} invoice(s)"}), 400
+    conn.execute("DELETE FROM vendors WHERE id = ?", (vendor_id,))
+    conn.commit()
+    conn.close()
+    return jsonify({"success": True})
+
+
+# ---------------------------------------------------------------------------
+# Audit log (#20)
+# ---------------------------------------------------------------------------
+
+@app.route("/api/invoices/<invoice_id>/audit")
+@require_auth
+def get_audit_log(invoice_id):
+    """Get audit log entries for an invoice (#20)."""
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT * FROM audit_log WHERE invoice_id = ? ORDER BY created_at DESC",
+        (invoice_id,)
+    ).fetchall()
+    conn.close()
+    return jsonify([dict(r) for r in rows])
+
+
+# ---------------------------------------------------------------------------
+# Data retention / archive (#25)
+# ---------------------------------------------------------------------------
+
+@app.route("/api/archive", methods=["POST"])
+@require_auth
+def archive_old_invoices():
+    """Archive invoices older than a specified age (#25).
+
+    Query params:
+      older_than_days — default 730 (2 years)
+    Moves old invoices to an archive directory and removes from active DB.
+    """
+    import shutil
+    older_than = int(request.args.get("older_than_days", "730"))
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT id, pdf_path FROM invoices "
+        "WHERE created_at < datetime('now', ?) "
+        "ORDER BY created_at ASC",
+        (f"-{older_than} days",)
+    ).fetchall()
+
+    archive_dir = DATA_DIR / "archive"
+    archive_dir.mkdir(parents=True, exist_ok=True)
+
+    archived = 0
+    for r in rows:
+        pdf_path = _resolve_pdf_path(r["pdf_path"])
+        if pdf_path and pdf_path.exists():
+            shutil.move(str(pdf_path), str(archive_dir / pdf_path.name))
+        conn.execute("DELETE FROM invoices WHERE id = ?", (r["id"],))
+        archived += 1
+    conn.commit()
+    conn.close()
+    return jsonify({"success": True, "archived": archived})
 
 
 if __name__ == "__main__":

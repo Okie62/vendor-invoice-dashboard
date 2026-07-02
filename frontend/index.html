@@ -138,6 +138,34 @@
   .btn-save:hover { background: var(--accent-hover); }
   .btn-download { background: var(--border); color: var(--text); padding: 8px 16px; border: none; border-radius: 6px; font-size: 13px; cursor: pointer; text-decoration: none; display: inline-flex; align-items: center; gap: 6px; }
   .btn-download:hover { background: #353a48; }
+
+  /* --- Export & pagination controls --- */
+  .export-row { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
+  .export-btn { background: var(--border); color: var(--text); padding: 6px 14px; border: none; border-radius: 6px; font-size: 13px; cursor: pointer; display: inline-flex; align-items: center; gap: 6px; }
+  .export-btn:hover { background: #353a48; }
+  .pagination-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 12px; flex-wrap: wrap; }
+  .pagination-row .page-info { font-size: 13px; color: var(--text-dim); }
+  .pagination-row .page-btns { display: flex; gap: 8px; }
+  .pagination-row .page-btns button { padding: 6px 16px; border: none; border-radius: 6px; background: var(--border); color: var(--text); font-size: 13px; cursor: pointer; }
+  .pagination-row .page-btns button:disabled { opacity: 0.4; cursor: not-allowed; }
+  .pagination-row .page-btns button:not(:disabled):hover { background: #353a48; }
+
+  /* --- Mobile responsiveness --- */
+  .table-scroll { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  .table-scroll table { min-width: 600px; }
+  @media (max-width: 768px) {
+    body { padding: 12px; }
+    .filter-row { flex-direction: column; align-items: stretch; }
+    .filter-group { min-width: 100% !important; max-width: 100% !important; }
+    .header { flex-direction: column; align-items: flex-start; }
+    .header > div:last-child { flex-wrap: wrap; }
+    .charts-grid { grid-template-columns: 1fr; }
+    .modal { width: 100vw; height: 100vh; max-width: 100vw; }
+    .modal-body { flex-direction: column; }
+    .pdf-pane, .data-pane { width: 100%; }
+    .pdf-pane { border-right: none; border-bottom: 1px solid var(--border); max-height: 40vh; }
+    .data-pane { max-height: 50vh; }
+  }
 </style>
 </head>
 <body>
@@ -157,7 +185,7 @@
 <!-- Filter Bar -->
 <div class="filter-bar">
   <div class="filter-row">
-    <div class="filter-group" style="max-width:200px">
+    <div class="filter-group">
       <label>Vendor</label>
       <select id="vendorFilter">
         <option value="">All Vendors</option>
@@ -169,7 +197,27 @@
         <option value="">All Customers</option>
       </select>
     </div>
-    <div class="filter-group" style="min-width:250px">
+    <div class="filter-group">
+      <label>Search Invoices (ID or billing period)</label>
+      <input type="text" id="invoiceSearch" placeholder="Search by invoice ID or billing period...">
+    </div>
+    <div class="filter-group" style="max-width:180px">
+      <label>Start Date</label>
+      <input type="date" id="startDate">
+    </div>
+    <div class="filter-group" style="max-width:180px">
+      <label>End Date</label>
+      <input type="date" id="endDate">
+    </div>
+    <div class="filter-group" style="max-width:110px; display:flex; align-items:flex-end">
+      <button class="btn btn-primary" style="width:100%" onclick="applyFilters()">Apply</button>
+    </div>
+    <div class="filter-group" style="max-width:110px; display:flex; align-items:flex-end">
+      <button class="btn btn-secondary" style="width:100%" onclick="clearFilters()">Clear</button>
+    </div>
+  </div>
+  <div class="filter-row" style="margin-top:16px">
+    <div class="filter-group">
       <label>Invoices (click to toggle)</label>
       <div id="invoiceList" class="invoice-list"></div>
     </div>
@@ -181,6 +229,10 @@
       </div>
       <div class="upload-status" id="uploadStatus"></div>
     </div>
+    <div class="filter-group" style="max-width:200px; display:flex; flex-direction:column; gap:8px; justify-content:flex-end">
+      <label>Data Export</label>
+      <button class="export-btn" onclick="exportCSV('invoices')">📥 Export Invoices CSV</button>
+    </div>
   </div>
 </div>
 
@@ -191,12 +243,17 @@
 <div class="charts-grid">
   <div class="chart-card"><h3>Charges by Customer (Top 10)</h3><div class="chart-container"><canvas id="customerChart"></canvas></div></div>
   <div class="chart-card"><h3>Charges by Service Category</h3><div class="chart-container"><canvas id="categoryChart"></canvas></div></div>
+  <div class="chart-card" style="grid-column: 1 / -1"><h3>Monthly Charges Trend</h3><div class="chart-container"><canvas id="trendChart"></canvas></div></div>
 </div>
 
 <!-- Customer Table -->
 <div class="section">
   <div class="section-title">Customer Accounts <span class="count" id="customerCount"></span></div>
+  <div class="export-row">
+    <button class="export-btn" onclick="exportCSV('customers')">📥 Export Customers CSV</button>
+  </div>
   <input type="text" class="search-box" id="customerSearch" placeholder="Search customers...">
+  <div class="table-scroll">
   <table id="customerTable">
     <thead><tr>
       <th data-sort="name">Customer</th>
@@ -207,12 +264,17 @@
     </tr></thead>
     <tbody id="customerBody"></tbody>
   </table>
+  </div>
 </div>
 
 <!-- Line Items Table -->
 <div class="section">
   <div class="section-title">Line Items <span class="count" id="lineItemCount"></span></div>
+  <div class="export-row">
+    <button class="export-btn" onclick="exportCSV('line-items')">📥 Export Line Items CSV</button>
+  </div>
   <input type="text" class="search-box" id="lineSearch" placeholder="Search line items...">
+  <div class="table-scroll">
   <table id="lineTable">
     <thead><tr>
       <th data-sort="customer">Customer</th>
@@ -226,6 +288,14 @@
     </tr></thead>
     <tbody id="lineBody"></tbody>
   </table>
+  </div>
+  <div class="pagination-row" id="linePagination" style="display:none">
+    <span class="page-info" id="linePageInfo"></span>
+    <div class="page-btns">
+      <button id="linePrevBtn" onclick="lineItemsPage--; renderLineItems(document.getElementById('lineSearch').value);">← Prev</button>
+      <button id="lineNextBtn" onclick="lineItemsPage++; renderLineItems(document.getElementById('lineSearch').value);">Next →</button>
+    </div>
+  </div>
 </div>
 
 <!-- Invoice Detail Modal -->
@@ -280,6 +350,11 @@ let customerSort = {col: 'total', dir: 'desc'};
 let lineSort = {col: 'customer', dir: 'asc'};
 let customerChart = null;
 let categoryChart = null;
+let trendChart = null;
+let dateFilter = { start: '', end: '' };
+let searchQuery = '';
+let lineItemsPage = 0;
+const LINE_ITEMS_PER_PAGE = 50;
 
 // --- Auth helpers ---
 function getAccessToken() { return localStorage.getItem('access_token') || ''; }
@@ -353,17 +428,27 @@ async function loadData() {
   const vendorRes = await authFetch('/api/vendors');
   VENDORS = await vendorRes.json();
 
-  // Fetch invoices (optionally filtered by vendor)
-  const url = selectedVendor ? `/api/invoices?vendor=${encodeURIComponent(selectedVendor)}` : '/api/invoices';
-  const invRes = await authFetch(url);
+  // Fetch invoices (optionally filtered by vendor) with date + search params
+  const params = new URLSearchParams();
+  if (selectedVendor) params.set('vendor', selectedVendor);
+  if (dateFilter.start) params.set('start', dateFilter.start);
+  if (dateFilter.end) params.set('end', dateFilter.end);
+  if (searchQuery) params.set('search', searchQuery);
+  const qs = params.toString();
+  const invRes = await authFetch('/api/invoices' + (qs ? '?' + qs : ''));
   const invoiceList = await invRes.json();
 
-  // Fetch detail (customers + line items) for each invoice
-  INVOICES = [];
-  for (const inv of invoiceList) {
-    const detailRes = await authFetch(`/api/invoices/${inv.id}`);
-    const detail = await detailRes.json();
-    INVOICES.push({
+  // Fetch detail (customers + line_items) for all invoices in one bulk call
+  const bulkRes = await authFetch('/api/invoices/bulk');
+  const bulkData = await bulkRes.json();
+  const bulkById = {};
+  if (Array.isArray(bulkData.invoices)) {
+    bulkData.invoices.forEach(b => { bulkById[b.id] = b; });
+  }
+
+  INVOICES = invoiceList.map(inv => {
+    const detail = bulkById[inv.id] || { customers: [], line_items: [] };
+    return {
       id: inv.id,
       vendor: inv.vendor_name,
       billing_period: inv.billing_period,
@@ -379,15 +464,15 @@ async function loadData() {
         new_charges: inv.new_charges || 0,
         outstanding_balance: inv.outstanding_balance || 0
       },
-      customers: detail.customers.map(c => ({
+      customers: (detail.customers || []).map(c => ({
         name: c.name, account_id: c.account_id, partner_id: c.partner_id, total: c.total
       })),
-      line_items: detail.line_items.map(li => ({
+      line_items: (detail.line_items || []).map(li => ({
         invoice_id: li.invoice_id, customer: li.customer_name, date: li.date,
         item: li.item, type: li.type, qty: li.qty, unit_price: li.unit_price, amount: li.amount
       }))
-    });
-  }
+    };
+  });
 
   selectedInvoices.clear();
   INVOICES.forEach(inv => selectedInvoices.add(inv.id));
@@ -401,7 +486,7 @@ async function loadData() {
 function renderVendors() {
   const sel = document.getElementById('vendorFilter');
   sel.innerHTML = '<option value="">All Vendors</option>' +
-    VENDORS.map(v => `<option value="${v.name}" ${v.name === selectedVendor ? 'selected' : ''}>${v.name}</option>`).join('');
+    VENDORS.map(v => `<option value="${esc(v.name)}" ${v.name === selectedVendor ? 'selected' : ''}>${esc(v.name)}</option>`).join('');
   document.getElementById('vendorBadge').textContent = selectedVendor || 'All Vendors';
 }
 
@@ -451,14 +536,15 @@ function getFilteredCustomers() {
 
 function getSummary() {
   const invs = getFilteredInvoices();
-  let prev = 0, payment = 0, newCharges = 0, outstanding = 0;
+  let prev = 0, payment = 0, newCharges = 0, outstanding = 0, cc = 0;
   invs.forEach(inv => {
     prev += inv.summary.previous_balance;
     payment += inv.summary.payment_received;
     newCharges += inv.summary.new_charges;
     outstanding += inv.summary.outstanding_balance;
+    cc += inv.summary.credit_card_surcharges || 0;
   });
-  return { previous_balance: prev, payment_received: payment, new_charges: newCharges, outstanding_balance: outstanding };
+  return { previous_balance: prev, payment_received: payment, new_charges: newCharges, outstanding_balance: outstanding, cc };
 }
 
 function getAllCustomerNames() {
@@ -478,17 +564,17 @@ function renderFilters() {
   // Customer dropdown
   const custSel = document.getElementById('customerFilter');
   custSel.innerHTML = '<option value="">All Customers</option>' +
-    getAllCustomerNames().map(n => `<option value="${n}" ${n === selectedCustomer ? 'selected' : ''}>${n}</option>`).join('');
+    getAllCustomerNames().map(n => `<option value="${esc(n)}" ${n === selectedCustomer ? 'selected' : ''}>${esc(n)}</option>`).join('');
 
   // Invoice list with toggle + delete
   const invList = document.getElementById('invoiceList');
   invList.innerHTML = INVOICES.map(inv => {
     const isSelected = selectedInvoices.has(inv.id);
-    const label = `#${inv.id}${inv.is_credit_memo ? ' 📝' : ''} — ${inv.billing_period}`;
-    return `<div class="invoice-item ${isSelected ? 'selected' : ''}" data-invoice-id="${inv.id}">
+    const label = `#${esc(inv.id)}${inv.is_credit_memo ? ' 📝' : ''} — ${esc(inv.billing_period)}`;
+    return `<div class="invoice-item ${isSelected ? 'selected' : ''}" data-invoice-id="${esc(inv.id)}">
       <span class="invoice-item-label">${label}</span>
-      <button class="invoice-view-btn" data-view-id="${inv.id}" title="View invoice detail">👁</button>
-      <button class="invoice-delete-btn" data-delete-id="${inv.id}" title="Delete invoice">✕</button>
+      <button class="invoice-view-btn" data-view-id="${esc(inv.id)}" title="View invoice detail">👁</button>
+      <button class="invoice-delete-btn" data-delete-id="${esc(inv.id)}" title="Delete invoice">✕</button>
     </div>`;
   }).join('');
 
@@ -532,6 +618,7 @@ function renderSummary() {
     {label: 'Previous Balance', value: fmtMoney(s.previous_balance), cls: ''},
     {label: 'Payment Received', value: fmtMoney(-s.payment_received), cls: 'green'},
     {label: 'New Charges', value: fmtMoney(s.new_charges), cls: 'orange'},
+    {label: 'CC Surcharges', value: fmtMoney(s.cc), cls: 'blue'},
     {label: 'Outstanding Balance', value: fmtMoney(s.outstanding_balance), cls: 'red'},
     {label: 'Active Customers', value: getFilteredCustomers().length, cls: 'blue'},
     {label: 'Selected Invoices', value: invs.length + ' / ' + INVOICES.length, cls: ''},
@@ -594,6 +681,53 @@ function renderCharts() {
       plugins: { legend: { position: 'right', labels: { color: '#8b8f9a', font: { size: 12 }, padding: 10, boxWidth: 12 } },
         tooltip: { callbacks: { label: ctx => ctx.label + ': ' + fmtMoney(ctx.parsed) } } } }
   });
+
+  // Monthly trend line chart — group invoices by billing_period month
+  const monthly = {};
+  getFilteredInvoices().forEach(inv => {
+    const bp = inv.billing_period || '';
+    // Normalize to YYYY-MM; supports "YYYY-MM-DD", "MM/DD/YYYY", "YYYY-MM"
+    let monthKey = '';
+    if (/^\d{4}-\d{2}/.test(bp)) {
+      monthKey = bp.substring(0, 7);
+    } else if (/^\d{4}-\d{2}-\d{2}/.test(bp)) {
+      monthKey = bp.substring(0, 7);
+    } else {
+      const d = new Date(bp);
+      if (!isNaN(d)) {
+        monthKey = d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0');
+      } else {
+        monthKey = bp;
+      }
+    }
+    monthly[monthKey] = (monthly[monthKey] || 0) + (inv.summary.new_charges || 0);
+  });
+  const monthKeys = Object.keys(monthly).sort();
+  if (trendChart) trendChart.destroy();
+  trendChart = new Chart(document.getElementById('trendChart'), {
+    type: 'line',
+    data: {
+      labels: monthKeys,
+      datasets: [{
+        label: 'Total Charges',
+        data: monthKeys.map(k => monthly[k]),
+        borderColor: '#3b82f6',
+        backgroundColor: 'rgba(59,130,246,0.15)',
+        fill: true,
+        tension: 0.3,
+        pointRadius: 3,
+        pointBackgroundColor: '#3b82f6'
+      }]
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: { legend: { display: false }, tooltip: { callbacks: { label: ctx => fmtMoney(ctx.parsed.y) } } },
+      scales: {
+        x: { ticks: { color: '#8b8f9a', font: { size: 11 } }, grid: { color: '#2a2e3a' } },
+        y: { ticks: { color: '#8b8f9a', callback: v => '$' + v.toLocaleString() }, grid: { color: '#2a2e3a' } }
+      }
+    }
+  });
 }
 
 // --- Render: Customer Table ---
@@ -613,9 +747,9 @@ function renderCustomers(filter='') {
   document.getElementById('customerCount').textContent = rows.length + ' accounts';
   document.getElementById('customerBody').innerHTML = rows.map(c => `
     <tr>
-      <td class="customer-name">${c.name}</td>
-      <td class="account-id">${c.account_id}</td>
-      <td class="account-id">${c.partner_id}</td>
+      <td class="customer-name">${esc(c.name)}</td>
+      <td class="account-id">${esc(c.account_id)}</td>
+      <td class="account-id">${esc(c.partner_id)}</td>
       <td class="amount">${fmtMoney(c.total)}</td>
       <td class="amount" style="color:var(--text-dim)">${total > 0 ? (c.total / total * 100).toFixed(1) : '0.0'}%</td>
     </tr>
@@ -639,20 +773,41 @@ function renderLineItems(filter='') {
     return va < vb ? 1 : -1;
   });
   document.getElementById('lineItemCount').textContent = rows.length + ' items';
-  document.getElementById('lineBody').innerHTML = rows.map(li => {
+
+  // Pagination
+  const totalPages = Math.max(1, Math.ceil(rows.length / LINE_ITEMS_PER_PAGE));
+  if (lineItemsPage >= totalPages) lineItemsPage = totalPages - 1;
+  if (lineItemsPage < 0) lineItemsPage = 0;
+  const pageStart = lineItemsPage * LINE_ITEMS_PER_PAGE;
+  const pageRows = rows.slice(pageStart, pageStart + LINE_ITEMS_PER_PAGE);
+
+  document.getElementById('lineBody').innerHTML = pageRows.map(li => {
     const badgeCls = li.type === 'monthly' ? 'badge-monthly' : li.type === 'service_charge' ? 'badge-service' : li.type === 'tax' ? 'badge-tax' : 'badge-credit';
     const badgeText = li.type === 'monthly' ? 'Monthly' : li.type === 'service_charge' ? 'Service' : li.type === 'tax' ? 'Tax' : 'Credit';
     return `<tr>
-      <td style="color:var(--text)">${li.customer}</td>
-      <td style="color:var(--text-dim)">${li.date}</td>
-      <td>${li.item}</td>
+      <td style="color:var(--text)">${esc(li.customer)}</td>
+      <td style="color:var(--text-dim)">${esc(li.date)}</td>
+      <td>${esc(li.item)}</td>
       <td><span class="badge ${badgeCls}">${badgeText}</span></td>
       <td style="text-align:right">${li.qty.toLocaleString()}</td>
       <td class="amount" style="font-weight:400;color:var(--text-dim)">${fmtMoney(li.unit_price)}</td>
       <td class="amount ${li.amount < 0 ? 'negative' : ''}">${fmtMoney(li.amount)}</td>
-      <td><span class="badge badge-invoice" style="cursor:pointer" onclick="openDetailModal('${li.invoice_id}')">#${li.invoice_id}</span></td>
+      <td><span class="badge badge-invoice" style="cursor:pointer" onclick="openDetailModal('${esc(li.invoice_id)}')">#${esc(li.invoice_id)}</span></td>
     </tr>`;
   }).join('');
+
+  // Pagination controls
+  const pagEl = document.getElementById('linePagination');
+  if (pagEl) {
+    pagEl.style.display = rows.length > LINE_ITEMS_PER_PAGE ? 'flex' : 'none';
+    const infoEl = document.getElementById('linePageInfo');
+    if (infoEl) infoEl.textContent = `Page ${lineItemsPage + 1} of ${totalPages} (${rows.length} items)`;
+    const prevBtn = document.getElementById('linePrevBtn');
+    const nextBtn = document.getElementById('lineNextBtn');
+    if (prevBtn) prevBtn.disabled = lineItemsPage === 0;
+    if (nextBtn) nextBtn.disabled = lineItemsPage >= totalPages - 1;
+  }
+
   document.querySelectorAll('#lineTable th').forEach(th => {
     th.classList.remove('sorted-asc', 'sorted-desc');
     if (th.dataset.sort === lineSort.col) th.classList.add(lineSort.dir === 'asc' ? 'sorted-asc' : 'sorted-desc');
@@ -712,16 +867,65 @@ async function handleFileUpload(files) {
 // --- Event Listeners ---
 document.getElementById('vendorFilter').addEventListener('change', async e => {
   selectedVendor = e.target.value;
+  lineItemsPage = 0;
   await loadData();
 });
 
 document.getElementById('customerFilter').addEventListener('change', e => {
   selectedCustomer = e.target.value;
+  lineItemsPage = 0;
   renderAll();
 });
 
 document.getElementById('customerSearch').addEventListener('input', e => renderCustomers(e.target.value));
-document.getElementById('lineSearch').addEventListener('input', e => renderLineItems(e.target.value));
+document.getElementById('lineSearch').addEventListener('input', e => { lineItemsPage = 0; renderLineItems(e.target.value); });
+
+// Invoice search — triggers server-side search via loadData (debounced)
+let searchTimer = null;
+document.getElementById('invoiceSearch').addEventListener('input', e => {
+  searchQuery = e.target.value.trim();
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(() => { loadData(); }, 400);
+});
+
+// Date filter handlers
+document.getElementById('startDate').addEventListener('change', e => { dateFilter.start = e.target.value; loadData(); });
+document.getElementById('endDate').addEventListener('change', e => { dateFilter.end = e.target.value; loadData(); });
+
+function applyFilters() {
+  dateFilter.start = document.getElementById('startDate').value;
+  dateFilter.end = document.getElementById('endDate').value;
+  searchQuery = document.getElementById('invoiceSearch').value.trim();
+  loadData();
+}
+
+function clearFilters() {
+  document.getElementById('startDate').value = '';
+  document.getElementById('endDate').value = '';
+  document.getElementById('invoiceSearch').value = '';
+  dateFilter = { start: '', end: '' };
+  searchQuery = '';
+  loadData();
+}
+
+// --- CSV Export ---
+async function exportCSV(type) {
+  try {
+    const res = await authFetch(`/api/export/${type}`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${type}-${new Date().toISOString().slice(0,10)}.csv`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  } catch(err) {
+    alert('Failed to export CSV: ' + err.message);
+  }
+}
 
 document.querySelectorAll('#customerTable th').forEach(th => {
   th.addEventListener('click', () => {

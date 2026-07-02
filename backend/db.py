@@ -1,11 +1,15 @@
 """
 SQLite database for vendor invoice tracking.
 
-Tables: vendors, invoices, customers, line_items, processed_emails
+Tables: vendors, invoices, customers, line_items, processed_emails,
+        users, audit_log, vendor_aliases
 """
 
 import sqlite3
+import logging
 from config import DATA_DIR
+
+log = logging.getLogger(__name__)
 
 DB_PATH = DATA_DIR / "db" / "invoices.db"
 
@@ -79,7 +83,44 @@ CREATE TABLE IF NOT EXISTS users (
     is_admin INTEGER DEFAULT 0 NOT NULL,
     created_at TEXT DEFAULT (datetime('now'))
 );
+
+CREATE TABLE IF NOT EXISTS audit_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    invoice_id TEXT NOT NULL,
+    user_id INTEGER,
+    user_email TEXT,
+    action TEXT NOT NULL,
+    changes TEXT,
+    created_at TEXT DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS vendor_aliases (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    domain_key TEXT NOT NULL UNIQUE,
+    display_name TEXT NOT NULL,
+    created_at TEXT DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS schema_migrations (
+    version INTEGER PRIMARY KEY,
+    applied_at TEXT DEFAULT (datetime('now'))
+);
 """
+
+
+# -----------------------------------------------------------------------
+# Migration system (#30) — versioned, forward-only SQL migrations
+# -----------------------------------------------------------------------
+
+MIGRATIONS = [
+    # v1: add invoice_date column to invoices (if not present from CREATE TABLE)
+    #     This is a no-op if the column already exists from the schema above.
+    "ALTER TABLE invoices ADD COLUMN invoice_date TEXT",
+
+    # v2: add filename column to processed_emails for multi-attachment logging (#17)
+    #     The column already exists in the original schema, so this is a no-op
+    #     for new DBs. For existing DBs it was already there too.
+]
 
 
 def get_db():
@@ -90,9 +131,72 @@ def get_db():
     return conn
 
 
+def _get_schema_version(conn):
+    """Get the current schema version, or 0 if no migrations applied."""
+    try:
+        row = conn.execute(
+            "SELECT MAX(version) as v FROM schema_migrations"
+        ).fetchone()
+        return row["v"] if row and row["v"] else 0
+    except sqlite3.OperationalError:
+        # schema_migrations table doesn't exist yet
+        return 0
+
+
+def _run_migrations(conn):
+    """Apply pending migrations forward-only."""
+    # Ensure schema_migrations table exists
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS schema_migrations (
+            version INTEGER PRIMARY KEY,
+            applied_at TEXT DEFAULT (datetime('now'))
+        )
+    """)
+    conn.commit()
+
+    current = _get_schema_version(conn)
+    for i, sql in enumerate(MIGRATIONS, start=1):
+        if i <= current:
+            continue
+        try:
+            conn.execute(sql)
+            conn.execute(
+                "INSERT INTO schema_migrations (version) VALUES (?)",
+                (i,)
+            )
+            conn.commit()
+            log.info(f"Applied migration v{i}")
+        except sqlite3.OperationalError as e:
+            # Column already exists — mark as applied and continue
+            if "duplicate column" in str(e).lower():
+                conn.execute(
+                    "INSERT OR IGNORE INTO schema_migrations (version) VALUES (?)",
+                    (i,)
+                )
+                conn.commit()
+                log.debug(f"Migration v{i} skipped (column exists)")
+            else:
+                log.warning(f"Migration v{i} failed: {e}")
+                conn.rollback()
+
+
 def init_db():
-    """Create all tables if they don't exist."""
+    """Create all tables if they don't exist and run migrations."""
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = get_db()
     conn.executescript(SCHEMA_SQL)
+    conn.commit()
+    _run_migrations(conn)
     conn.close()
+
+
+def log_audit(conn, invoice_id, user_id, user_email, action, changes=None):
+    """Insert an audit log entry (#20)."""
+    import json
+    conn.execute(
+        "INSERT INTO audit_log (invoice_id, user_id, user_email, action, changes) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (invoice_id, user_id, user_email, action,
+         json.dumps(changes) if changes else None)
+    )
+    conn.commit()

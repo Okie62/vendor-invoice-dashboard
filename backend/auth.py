@@ -42,12 +42,15 @@ def verify_password(plain_password: str, hashed_password: str) -> bool:
 # JWT tokens
 # -----------------------------------------------------------------------
 
-def create_access_token(user_id: int, expires_minutes: Optional[int] = None) -> str:
+def create_access_token(user_id: int, expires_minutes: Optional[int] = None,
+                        email: str = "") -> str:
     """Create a short-lived JWT access token."""
     expire = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(
         minutes=expires_minutes if expires_minutes is not None else ACCESS_TOKEN_EXPIRE_MINUTES
     )
     payload = {"sub": str(user_id), "exp": expire, "type": "access"}
+    if email:
+        payload["email"] = email
     return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
 
 
@@ -159,7 +162,7 @@ def extract_token_from_request() -> Optional[str]:
 def require_auth(f):
     """Decorator that requires a valid JWT access token.
 
-    On success, sets g.current_user_id to the user's DB ID.
+    On success, sets g.current_user_id and g.current_user_email.
     On failure, returns 401 with JSON error.
     """
     @functools.wraps(f)
@@ -178,6 +181,8 @@ def require_auth(f):
             return jsonify({"error": "Invalid token payload"}), 401
 
         g.current_user_id = user_id
+        # Also fetch email for audit logging (#20)
+        g.current_user_email = payload.get("email", "")
         return f(*args, **kwargs)
 
     return decorated

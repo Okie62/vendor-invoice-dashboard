@@ -106,6 +106,17 @@ def process_email(conn, email_data: dict):
         )
         parsed_invoices.append(parsed)
 
+        # Send notification (#21)
+        try:
+            from notifier import notify_new_invoice
+            notify_new_invoice(
+                parsed.invoice_id, vendor_name,
+                parsed.outstanding_balance or parsed.new_charges,
+                parsed.billing_period
+            )
+        except Exception as e:
+            log.warning(f"Notification failed: {e}")
+
     # Send confirmation reply
     if parsed_invoices:
         reply_addr = extract_reply_address(email_data.get("from", ""))
@@ -126,11 +137,13 @@ def process_email(conn, email_data: dict):
             log.warning("No reply address found in From header — skipping reply")
 
     # Log to processed_emails
+    # Store all attachment filenames (#17 — was only logging first)
+    all_filenames = ", ".join(a["filename"] for a in email_data["attachments"])
     conn.execute(
         "INSERT OR REPLACE INTO processed_emails "
         "(message_id, vendor_name, filename, processed_at) "
         "VALUES (?, ?, ?, datetime('now'))",
-        (email_data["message_id"], vendor_name, email_data["attachments"][0]["filename"])
+        (email_data["message_id"], vendor_name, all_filenames)
     )
     conn.commit()
 
@@ -154,21 +167,29 @@ def store_invoice(conn, vendor_id: int, parsed: ParsedInvoice, pdf_path: str,
                   email_msg_id: str, source: str):
     """Insert an invoice and all its customers/line items into the DB."""
 
-    # Insert or replace invoice
+    # Store PDF path relative to DATA_DIR (#26 — was absolute, broke across environments)
+    from config import DATA_DIR
+    try:
+        rel_pdf_path = str(Path(pdf_path).relative_to(DATA_DIR))
+    except ValueError:
+        rel_pdf_path = pdf_path  # fallback if not under DATA_DIR
+
+    # Insert or replace invoice (includes invoice_date #9)
     conn.execute("""
         INSERT OR REPLACE INTO invoices
-        (id, vendor_id, billing_period, is_credit_memo, references_invoice,
+        (id, vendor_id, billing_period, invoice_date, is_credit_memo, references_invoice,
          partner_name, partner_id, partner_username,
          previous_balance, credit_card_surcharges, payment_received,
          new_charges, outstanding_balance, source, email_message_id, pdf_path)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         parsed.invoice_id, vendor_id, parsed.billing_period,
+        getattr(parsed, 'invoice_date', ''),
         int(parsed.is_credit_memo), parsed.references_invoice,
         parsed.partner_name, parsed.partner_id, parsed.partner_username,
         parsed.previous_balance, parsed.credit_card_surcharges,
         parsed.payment_received, parsed.new_charges,
-        parsed.outstanding_balance, source, email_msg_id, pdf_path
+        parsed.outstanding_balance, source, email_msg_id, rel_pdf_path
     ))
 
     # Delete old customers/line_items if re-processing

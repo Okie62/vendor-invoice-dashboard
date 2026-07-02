@@ -109,3 +109,20 @@ def extract_vendor(subject: str, body_text: str, from_header: str) -> tuple[str,
 
     log.debug("Vendor extraction failed entirely; using 'Unknown'")
     return "Unknown", False
+
+
+def get_vendor_aliases(conn):
+    """Load vendor aliases from DB, falling back to config defaults (#22).
+
+    DB aliases override the hardcoded VENDOR_ALIASES from config.py.
+    """
+    aliases = dict(VENDOR_ALIASES)  # start with config defaults
+    try:
+        rows = conn.execute(
+            "SELECT domain_key, display_name FROM vendor_aliases"
+        ).fetchall()
+        for r in rows:
+            aliases[r["domain_key"]] = r["display_name"]
+    except Exception:
+        pass  # table might not exist yet
+    return aliases

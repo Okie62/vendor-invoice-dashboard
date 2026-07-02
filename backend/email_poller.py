@@ -15,22 +15,41 @@ import email.utils
 import imaplib
 import logging
 import re
+import time
 
 from config import GMAIL_ADDRESS, GMAIL_APP_PASSWORD
 
 log = logging.getLogger(__name__)
 
 
-def connect_imap() -> imaplib.IMAP4_SSL:
-    """Connect to Gmail via IMAP using app password."""
+def connect_imap(max_retries=3):
+    """Connect to Gmail via IMAP using app password.
+
+    Retries with exponential backoff (#23) — was just logging and giving up.
+    """
     if not GMAIL_ADDRESS or not GMAIL_APP_PASSWORD:
         raise RuntimeError(
             "GMAIL_ADDRESS and GMAIL_APP_PASSWORD must be set in .env"
         )
-    imap = imaplib.IMAP4_SSL("imap.gmail.com")
-    imap.login(GMAIL_ADDRESS, GMAIL_APP_PASSWORD)
-    log.debug("IMAP logged in as %s", GMAIL_ADDRESS)
-    return imap
+    last_err = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            imap = imaplib.IMAP4_SSL("imap.gmail.com")
+            imap.login(GMAIL_ADDRESS, GMAIL_APP_PASSWORD)
+            log.debug("IMAP logged in as %s", GMAIL_ADDRESS)
+            return imap
+        except Exception as e:
+            last_err = e
+            if attempt < max_retries:
+                wait = 2 ** attempt  # 2s, 4s, 8s
+                log.warning(
+                    "IMAP connection attempt %d/%d failed: %s — retrying in %ds",
+                    attempt, max_retries, e, wait
+                )
+                time.sleep(wait)
+    raise RuntimeError(
+        f"IMAP connection failed after {max_retries} attempts: {last_err}"
+    )
 
 
 def fetch_unseen_emails(imap: imaplib.IMAP4_SSL) -> list:

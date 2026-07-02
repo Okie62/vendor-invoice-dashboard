@@ -25,6 +25,7 @@ class ParsedInvoice:
     invoice_id: str
     vendor: str
     billing_period: str
+    invoice_date: str = ""
     is_credit_memo: bool = False
     references_invoice: Optional[str] = None
     partner_name: str = ""
@@ -73,10 +74,24 @@ def _parse_intermedia(full_text: str) -> ParsedInvoice:
     if period_match:
         billing_period = f"{period_match.group(1)} - {period_match.group(2)}"
     elif is_credit_memo:
-        date_match = re.search(r"date\s*of\s*issue\s*\n?\s*(\w+\s+\d{1,2},\s*\d{4})", full_text, re.IGNORECASE)
+        date_match = re.search(r"date\s*of\s*issue\s*\n?\s*(\w+\s+\d{1,2},\s+\d{4})", full_text, re.IGNORECASE)
         billing_period = date_match.group(1) if date_match else "Unknown"
     else:
         billing_period = "Unknown"
+
+    # Extract invoice date (#9 — column existed but was never populated)
+    inv_date_match = re.search(
+        r"(?:invoice|credit\s*memo)\s*(?:date|issued)\s*[:\n]\s*"
+        r"((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2},\s+\d{4})",
+        full_text, re.IGNORECASE
+    )
+    if not inv_date_match:
+        # Fallback: first date in the document near the top
+        inv_date_match = re.search(
+            r"((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2},\s+\d{4})",
+            full_text
+        )
+    invoice_date = inv_date_match.group(1) if inv_date_match else ""
 
     # Extract summary amounts
     def _extract_amount(pattern):
@@ -197,6 +212,7 @@ def _parse_intermedia(full_text: str) -> ParsedInvoice:
         invoice_id=invoice_id,
         vendor="Intermedia",
         billing_period=billing_period,
+        invoice_date=invoice_date,
         is_credit_memo=is_credit_memo,
         references_invoice=references_invoice,
         partner_name="Oklahoma Technology Solutions",
@@ -354,6 +370,7 @@ def _parse_barracuda(full_text: str) -> ParsedInvoice:
         invoice_id=invoice_id,
         vendor="Barracuda",
         billing_period=billing_period,
+        invoice_date=invoice_date,
         is_credit_memo=False,
         references_invoice=None,
         partner_name="Oklahoma Technology Solutions",
