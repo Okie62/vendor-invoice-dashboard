@@ -9,8 +9,25 @@ from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).parent.parent / ".env")
 
-# Paths — use RENDER env var if on Render, otherwise local
-BASE_DIR = Path(os.environ.get("RENDER_PROJECT_DIR", Path(__file__).parent.parent))
+# Paths — use RENDER_PROJECT_DIR env var if on Render, otherwise local.
+# On Render, RENDER_PROJECT_DIR is typically "/opt/render/project/src".
+# The persistent disk is mounted at /opt/render/project/src/data.
+# IMPORTANT: We must resolve to an absolute path so that changing the
+# working directory (e.g. gunicorn --chdir backend) doesn't break paths.
+_render_dir = os.environ.get("RENDER_PROJECT_DIR", "")
+if _render_dir and Path(_render_dir).is_absolute():
+    BASE_DIR = Path(_render_dir)
+elif _render_dir:
+    # Render sets RENDER_PROJECT_DIR="project" (relative).
+    # The real project root is /opt/render/project/src.
+    # Hardcode this so paths resolve correctly regardless of cwd.
+    _render_root = Path("/opt/render/project/src")
+    if _render_root.exists():
+        BASE_DIR = _render_root
+    else:
+        BASE_DIR = Path(_render_dir).resolve()
+else:
+    BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = BASE_DIR / "data"
 INVOICE_DIR = DATA_DIR / "invoices"
 DB_PATH = DATA_DIR / "db" / "invoices.db"
