@@ -240,8 +240,9 @@ def health_check():
 
 
 @app.route("/api/diagnostic")
+@require_auth
 def diagnostic():
-    """Diagnostic endpoint to debug data loss issues (temporarily public)."""
+    """Diagnostic endpoint showing DB paths and counts."""
     import sys
     from config import BASE_DIR, DATA_DIR, DB_PATH
 
