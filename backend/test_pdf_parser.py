@@ -10,7 +10,7 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-from pdf_parser import parse_pdf, ParsedInvoice, _parse_intermedia, _parse_barracuda
+from pdf_parser import parse_pdf, ParsedInvoice, _parse_intermedia, _parse_barracuda, _parse_flyover, _parse_contractor
 
 
 # --- Sample text snippets (mimic real PDF output) ---
@@ -170,3 +170,127 @@ class TestParsedInvoiceDataclass:
         assert pi.customers == []
         assert pi.line_items == []
         assert pi.previous_balance == 0
+
+
+FLYOVER_SAMPLE = """
+INVOICE
+Flyover Software
+12220 N MacArthur Blvd Ste F150
+Oklahoma City, OK 73162
+jay@btabs.com
++1 (405) 229-9700
+Bill to
+Billing Department
+Paluxy Energy Land Services
+Ship to
+Billing Department
+Paluxy Energy Land Services
+Invoice details
+Invoice no.: 250541
+Terms: Net 30
+Invoice date: 05/31/2026
+Due date: 06/30/2026
+#
+Product or service
+Description
+Qty
+Rate
+Amount
+1.
+BTABS Users
+Monthly charge for active BTABS users
+52
+$10.00
+$520.00
+Ways to pay
+Total
+$520.00
+Payment
+-$520.00
+Balance due
+$0.00
+Paid in Full
+"""
+
+
+CONTRACTOR_SAMPLE = """
+  \nInvoice # 247 \nDate: 06/16/26  Billing Period: 06/01/26 – 06/15/26 \nBill To \nFor \nJay Wade \nContractor Services \n12220 N. MacArthur Blvd., Oklahoma City, OK 73162 \n405-229-9700 \nAmount \nServices - 80 hours \n$2,106.71 \nServices Dates: 06/01/26 - 06/05/26, 06/08/26 – 06/12/26 and 06/15/26  \n        \nCustomer Service, Office Management and Billing \nItem Description \nJennifer Determan \n3024 Regency Ct, Oklahoma City, OK, \n73120\n405-833-5366\n\nSubtotal \nTax Rate \nOther Costs \nTotal Cost \n$2,106.71 \n$2,106.71 \n
+"""
+
+
+class TestFlyoverParser:
+    def test_parses_invoice_id(self):
+        result = _parse_flyover(FLYOVER_SAMPLE)
+        assert result.invoice_id == "250541"
+
+    def test_parses_vendor(self):
+        result = _parse_flyover(FLYOVER_SAMPLE)
+        assert result.vendor == "Flyover Software"
+
+    def test_parses_invoice_date(self):
+        result = _parse_flyover(FLYOVER_SAMPLE)
+        assert result.invoice_date == "05/31/2026"
+
+    def test_parses_billing_period(self):
+        result = _parse_flyover(FLYOVER_SAMPLE)
+        assert "05/31/2026" in result.billing_period
+        assert "06/30/2026" in result.billing_period
+
+    def test_parses_total(self):
+        result = _parse_flyover(FLYOVER_SAMPLE)
+        assert result.new_charges == 520.00
+
+    def test_parses_balance_due(self):
+        result = _parse_flyover(FLYOVER_SAMPLE)
+        assert result.outstanding_balance == 0.00
+
+    def test_parses_customer(self):
+        result = _parse_flyover(FLYOVER_SAMPLE)
+        assert len(result.customers) >= 1
+        assert "Paluxy" in result.customers[0]["name"]
+
+    def test_parses_line_items(self):
+        result = _parse_flyover(FLYOVER_SAMPLE)
+        assert len(result.line_items) >= 1
+        li = result.line_items[0]
+        assert "BTABS" in li["item"]
+        assert li["qty"] == 52
+        assert li["unit_price"] == 10.00
+        assert li["amount"] == 520.00
+
+
+class TestContractorParser:
+    def test_parses_invoice_id(self):
+        result = _parse_contractor(CONTRACTOR_SAMPLE)
+        assert result.invoice_id == "247"
+
+    def test_parses_vendor(self):
+        result = _parse_contractor(CONTRACTOR_SAMPLE)
+        assert result.vendor == "Jennifer Determan"
+
+    def test_parses_invoice_date(self):
+        result = _parse_contractor(CONTRACTOR_SAMPLE)
+        assert result.invoice_date == "06/16/26"
+
+    def test_parses_billing_period(self):
+        result = _parse_contractor(CONTRACTOR_SAMPLE)
+        assert "06/01/26" in result.billing_period
+        assert "06/15/26" in result.billing_period
+
+    def test_parses_amount(self):
+        result = _parse_contractor(CONTRACTOR_SAMPLE)
+        assert result.new_charges == 2106.71
+        assert result.outstanding_balance == 2106.71
+
+    def test_parses_line_items(self):
+        result = _parse_contractor(CONTRACTOR_SAMPLE)
+        assert len(result.line_items) >= 1
+        li = result.line_items[0]
+        assert li["qty"] == 80
+        assert li["amount"] == 2106.71
+        assert "80 hours" in li["item"]
+
+    def test_parses_customer(self):
+        result = _parse_contractor(CONTRACTOR_SAMPLE)
+        assert len(result.customers) >= 1
+        assert "Jay Wade" in result.customers[0]["name"]

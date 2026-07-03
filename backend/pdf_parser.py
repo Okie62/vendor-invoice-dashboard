@@ -48,10 +48,16 @@ def parse_pdf(file_path: str) -> ParsedInvoice:
         full_text += page.get_text() + "\n"
     doc.close()
 
-    if "barracuda" in full_text.lower():
+    text_lower = full_text.lower()
+
+    if "barracuda" in text_lower:
         return _parse_barracuda(full_text)
-    if "intermedia" in full_text.lower() or "OKTechSol" in full_text:
+    if "intermedia" in text_lower or "OKTechSol" in full_text:
         return _parse_intermedia(full_text)
+    if "flyover software" in text_lower or "btabs" in text_lower:
+        return _parse_flyover(full_text)
+    if "contractor services" in text_lower and "jennifer determan" in text_lower:
+        return _parse_contractor(full_text)
     raise ValueError("Unknown invoice format — no parser matched")
 
 
@@ -381,6 +387,321 @@ def _parse_barracuda(full_text: str) -> ParsedInvoice:
         payment_received=payment,
         new_charges=total,
         outstanding_balance=outstanding,
+        customers=customers,
+        line_items=line_items,
+    )
+
+
+def _parse_flyover(full_text: str) -> ParsedInvoice:
+    """Parse a Flyover Software / BTABS invoice.
+
+    Format:
+      INVOICE
+      Flyover Software
+      12220 N MacArthur Blvd Ste F150
+      Oklahoma City, OK 73162
+      jay@btabs.com
+      +1 (405) 229-9700
+      Bill to / Ship to sections
+      Invoice no.: 250541
+      Terms: Net 30
+      Invoice date: 05/31/2026
+      Due date: 06/30/2026
+      Line items table: # / Product or service / Description / Qty / Rate / Amount
+      Total / Payment / Balance due
+    """
+    lines = [l.strip() for l in full_text.split("\n") if l.strip()]
+
+    # Invoice ID
+    inv_match = re.search(r"Invoice no\.?\s*:?\s*(\d+)", full_text, re.IGNORECASE)
+    invoice_id = inv_match.group(1) if inv_match else "unknown"
+
+    # Dates
+    date_match = re.search(r"Invoice date\s*:?\s*(\d{1,2}/\d{1,2}/\d{4})", full_text, re.IGNORECASE)
+    invoice_date = date_match.group(1) if date_match else ""
+
+    due_match = re.search(r"Due date\s*:?\s*(\d{1,2}/\d{1,2}/\d{4})", full_text, re.IGNORECASE)
+    due_date = due_match.group(1) if due_match else ""
+
+    # Billing period = invoice date to due date (or just invoice date)
+    if invoice_date and due_date:
+        billing_period = f"{invoice_date} - {due_date}"
+    else:
+        billing_period = invoice_date or "Unknown"
+
+    # Summary amounts
+    def _extract_amount(pattern):
+        m = re.search(pattern, full_text, re.IGNORECASE)
+        if m:
+            return float(m.group(1).replace(",", ""))
+        return 0.0
+
+    total = _extract_amount(r"Total\s*\n?\s*\$([\d,.]+)")
+    payment = _extract_amount(r"Payment\s*\n?\s*-?\$([\d,.]+)")
+    balance_due = _extract_amount(r"Balance due\s*\n?\s*\$([\d,.]+)")
+
+    # Bill To — extract customer name (line after "Bill to")
+    customer_name = ""
+    bill_to_idx = None
+    for i, line in enumerate(lines):
+        if line.lower() == "bill to":
+            # Next non-empty line that isn't "Billing Department" is the customer
+            for j in range(i + 1, min(i + 4, len(lines))):
+                candidate = lines[j].strip()
+                if candidate.lower() == "billing department":
+                    continue
+                if candidate.lower() == "ship to":
+                    break
+                customer_name = candidate
+                break
+            bill_to_idx = i
+            break
+
+    # Parse line items: table with # / Product / Description / Qty / Rate / Amount
+    # The table appears after the header row containing "Product or service"
+    line_items = []
+    customers = []
+
+    # Find the start of the line items table
+    table_start = None
+    for i, line in enumerate(lines):
+        if "product or service" in line.lower():
+            table_start = i + 1
+            break
+
+    if table_start is not None:
+        i = table_start
+        while i < len(lines):
+            line = lines[i]
+
+            # Stop when we hit the total/summary section
+            if line.lower() in ("total", "payment", "balance due", "ways to pay", "paid in full"):
+                break
+
+            # Line item pattern: "# / Product / Description / Qty / Rate / Amount"
+            # In the PDF text these appear as separate lines:
+            #   1.
+            #   BTABS Users
+            #   Monthly charge for active BTABS users
+            #   52
+            #   $10.00
+            #   $520.00
+            if re.match(r"^\d+\.$", line):
+                # Read the next 5 lines: product, description, qty, rate, amount
+                if i + 5 < len(lines) + 1:
+                    product = lines[i + 1].strip() if i + 1 < len(lines) else ""
+                    description = lines[i + 2].strip() if i + 2 < len(lines) else ""
+
+                    # Qty must be a plain integer
+                    qty_str = lines[i + 3].strip() if i + 3 < len(lines) else ""
+                    if not re.match(r"^\d+$", qty_str):
+                        i += 1
+                        continue
+
+                    rate_str = lines[i + 4].strip() if i + 4 < len(lines) else ""
+                    amount_str = lines[i + 5].strip() if i + 5 < len(lines) else ""
+
+                    # Rate and amount must contain $
+                    if "$" not in rate_str or "$" not in amount_str:
+                        i += 1
+                        continue
+
+                    try:
+                        qty = int(qty_str)
+                        rate = float(rate_str.replace("$", "").replace(",", "").strip("()"))
+                        amount = float(amount_str.replace("$", "").replace(",", "").strip("()"))
+
+                        if amount_str.startswith("("):
+                            amount = -amount
+
+                        li_item = f"{product} ({description})" if description else product
+                        line_items.append({
+                            "customer": customer_name or "Flyover Software",
+                            "date": invoice_date,
+                            "item": li_item,
+                            "type": "service",
+                            "qty": qty,
+                            "unit_price": rate,
+                            "amount": amount,
+                        })
+                        i += 6
+                        continue
+                    except (ValueError, IndexError):
+                        pass
+
+            i += 1
+
+    # Create customer block
+    if customer_name or line_items:
+        customers.append({
+            "name": customer_name or "Flyover Software",
+            "account_id": "",
+            "partner_id": "",
+            "total": total,
+        })
+
+    return ParsedInvoice(
+        invoice_id=invoice_id,
+        vendor="Flyover Software",
+        billing_period=billing_period,
+        invoice_date=invoice_date,
+        is_credit_memo=False,
+        references_invoice=None,
+        partner_name="Flyover Software",
+        partner_id="",
+        partner_username="",
+        previous_balance=0,
+        credit_card_surcharges=0,
+        payment_received=payment,
+        new_charges=total,
+        outstanding_balance=balance_due,
+        customers=customers,
+        line_items=line_items,
+    )
+
+
+def _parse_contractor(full_text: str) -> ParsedInvoice:
+    """Parse a Jennifer Determan contractor services invoice.
+
+    Format:
+      Invoice # 247
+      Date: 06/16/26  Billing Period: 06/01/26 – 06/15/26
+      Bill To / For sections
+      Jay Wade / Contractor Services
+      12220 N. MacArthur Blvd., Oklahoma City, OK 73162
+      405-229-9700
+      Amount
+      Services - 80 hours
+      $2,106.71
+      Services Dates: 06/01/26 - 06/05/26, 06/08/26 – 06/12/26 and 06/15/26
+      Customer Service, Office Management and Billing
+      Item Description
+      Jennifer Determan
+      3024 Regency Ct, Oklahoma City, OK, 73120
+      405-833-5366
+      --- page 2 ---
+      Subtotal / Tax Rate / Other Costs / Total Cost
+      $2,106.71
+      $2,106.71
+    """
+    lines = [l.strip() for l in full_text.split("\n") if l.strip()]
+
+    # Invoice ID
+    inv_match = re.search(r"Invoice\s*#\s*(\d+)", full_text, re.IGNORECASE)
+    invoice_id = inv_match.group(1) if inv_match else "unknown"
+
+    # Date and Billing Period from the header line
+    date_match = re.search(r"Date:\s*(\d{1,2}/\d{1,2}/\d{2,4})", full_text, re.IGNORECASE)
+    invoice_date = date_match.group(1) if date_match else ""
+
+    period_match = re.search(
+        r"Billing Period:\s*(\d{1,2}/\d{1,2}/\d{2,4})\s*[–-]\s*(\d{1,2}/\d{1,2}/\d{2,4})",
+        full_text, re.IGNORECASE
+    )
+    if period_match:
+        billing_period = f"{period_match.group(1)} - {period_match.group(2)}"
+    else:
+        billing_period = invoice_date or "Unknown"
+
+    # Extract amount — the main dollar amount on the invoice
+    # "Services - 80 hours" followed by "$2,106.71"
+    amount_match = re.search(r"Services\s*-\s*(\d+)\s*hours\s*\n\s*\$([\d,.]+)", full_text, re.IGNORECASE)
+    if amount_match:
+        hours = int(amount_match.group(1))
+        total_amount = float(amount_match.group(2).replace(",", ""))
+    else:
+        # Fallback: find "Total Cost" followed by amount
+        total_match = re.search(r"Total Cost\s*\n?\s*\$([\d,.]+)", full_text, re.IGNORECASE)
+        total_amount = float(total_match.group(1).replace(",", "")) if total_match else 0.0
+        hours = 0
+
+    # Subtotal and tax
+    subtotal_match = re.search(r"Subtotal\s*\n?\s*\$([\d,.]+)", full_text, re.IGNORECASE)
+    subtotal = float(subtotal_match.group(1).replace(",", "")) if subtotal_match else total_amount
+
+    tax_match = re.search(r"Tax Rate\s*\n?\s*\$?([\d,.]+)%?", full_text, re.IGNORECASE)
+    tax = float(tax_match.group(1).replace(",", "")) if tax_match else 0.0
+
+    other_costs_match = re.search(r"Other Costs\s*\n?\s*\$([\d,.]+)", full_text, re.IGNORECASE)
+    other_costs = float(other_costs_match.group(1).replace(",", "")) if other_costs_match else 0.0
+
+    # Services dates
+    dates_match = re.search(r"Services Dates:\s*([^\n]+)", full_text, re.IGNORECASE)
+    services_dates = dates_match.group(1).strip() if dates_match else ""
+
+    # Description of services
+    desc_match = re.search(r"Customer Service,?\s*([^\n]+)", full_text, re.IGNORECASE)
+    description = desc_match.group(1).strip() if desc_match else "Contractor Services"
+
+    # Contractor name and address (Item Description section)
+    contractor_name = "Jennifer Determan"
+    contractor_addr = ""
+    contractor_phone = ""
+    for i, line in enumerate(lines):
+        if "item description" in line.lower():
+            # Next line is the contractor name
+            if i + 1 < len(lines):
+                contractor_name = lines[i + 1].strip()
+            if i + 2 < len(lines):
+                contractor_addr = lines[i + 2].strip()
+            if i + 3 < len(lines):
+                contractor_phone = lines[i + 3].strip()
+            break
+
+    # Bill To — skip label lines like "For"
+    bill_to_name = ""
+    for i, line in enumerate(lines):
+        if line.lower() == "bill to":
+            # Skip label lines ("For", etc.) and take the first real name
+            for j in range(i + 1, min(i + 4, len(lines))):
+                candidate = lines[j].strip()
+                if candidate.lower() in ("for", "ship to", ""):
+                    continue
+                bill_to_name = candidate
+                break
+            break
+
+    # Build line item
+    line_items = []
+    if total_amount > 0:
+        item_desc = f"Services - {hours} hours" if hours else "Contractor Services"
+        if services_dates:
+            item_desc += f" (Dates: {services_dates})"
+        line_items.append({
+            "customer": bill_to_name or "OKTechSol",
+            "date": invoice_date,
+            "item": item_desc,
+            "type": "service",
+            "qty": hours if hours else 1,
+            "unit_price": round(total_amount / hours, 2) if hours else total_amount,
+            "amount": total_amount,
+        })
+
+    # Customer block
+    customers = []
+    if bill_to_name or line_items:
+        customers.append({
+            "name": bill_to_name or "OKTechSol",
+            "account_id": "",
+            "partner_id": "",
+            "total": total_amount,
+        })
+
+    return ParsedInvoice(
+        invoice_id=invoice_id,
+        vendor="Jennifer Determan",
+        billing_period=billing_period,
+        invoice_date=invoice_date,
+        is_credit_memo=False,
+        references_invoice=None,
+        partner_name=contractor_name,
+        partner_id="",
+        partner_username="",
+        previous_balance=0,
+        credit_card_surcharges=0,
+        payment_received=0,
+        new_charges=total_amount,
+        outstanding_balance=total_amount,
         customers=customers,
         line_items=line_items,
     )

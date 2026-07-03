@@ -71,6 +71,8 @@ VENDOR_ALIASES = {
     "canva":         "Canva",
     "adobe":         "Adobe",
     "barracuda":     "Barracuda",
+    "flyover":       "Flyover Software",
+    "btabs":         "Flyover Software",
 }
 
 # Noise subdomain prefixes to strip
