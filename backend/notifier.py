@@ -21,6 +21,69 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 NOTIFY_EMAIL_TO = os.getenv("NOTIFY_EMAIL_TO", "")
 
 
+def notify_unknown_format(vendor, filename, subject, from_header, pdf_path, error_msg=""):
+    """Send an email alert when an invoice with an unknown format is received.
+
+    This triggers when parse_pdf() can't match the PDF to any known vendor
+    parser, so the user knows to teach the system the new format.
+    """
+    subject_line = f"⚠️ Unknown Invoice Format — {vendor} ({filename})"
+
+    body = (
+        f"An invoice was received that the system could not parse.\n\n"
+        f"  Vendor:         {vendor or 'Unknown'}\n"
+        f"  Filename:       {filename}\n"
+        f"  Email Subject:  {subject}\n"
+        f"  From:           {from_header}\n"
+        f"  Saved PDF:      {pdf_path}\n"
+    )
+    if error_msg:
+        body += f"  Parse Error:    {error_msg}\n"
+    body += (
+        f"\n"
+        f"What happened:\n"
+        f"  The PDF was saved to disk, but no parser recognized the format.\n"
+        f"  You need to teach the system this new format.\n\n"
+        f"Steps:\n"
+        f"  1. Download and open the PDF from the path above\n"
+        f"  2. Identify the vendor and key fields (invoice #, amounts, dates)\n"
+        f"  3. Add a parser function in pdf_parser.py and register it in parse_pdf()\n"
+        f"  4. Re-process the email or upload the PDF via the dashboard\n\n"
+        f"View all invoices: https://vendor-invoice-dashboard.onrender.com"
+    )
+
+    # Always send to the sender of the email (fallback to NOTIFY_EMAIL_TO)
+    recipients = set()
+    reply_addr = ""
+    try:
+        import email.utils as _emailutils
+        _, addr = _emailutils.parseaddr(from_header)
+        if addr and "@" in addr:
+            reply_addr = addr
+    except Exception:
+        pass
+    if reply_addr:
+        recipients.add(reply_addr)
+    if NOTIFY_EMAIL_TO:
+        for a in NOTIFY_EMAIL_TO.split(","):
+            a = a.strip()
+            if a:
+                recipients.add(a)
+
+    for addr in recipients:
+        try:
+            _send_email(addr, subject_line, body)
+        except Exception as e:
+            log.error(f"Unknown-format notification failed to {addr}: {e}")
+
+    # Telegram notification too
+    if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+        try:
+            _send_telegram(subject_line + "\n\n" + body)
+        except Exception as e:
+            log.error(f"Telegram notification failed: {e}")
+
+
 def notify_new_invoice(invoice_id, vendor, amount, billing_period):
     """Send notifications about a new invoice arrival (#21)."""
     subject = f"New Invoice: {vendor} — #{invoice_id}"

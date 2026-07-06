@@ -97,6 +97,19 @@ def process_email(conn, email_data: dict):
         except ValueError as e:
             log.warning(f"Could not parse {att['filename']}: {e} — storing as unstructured.")
             store_unparsed_invoice(conn, vendor_id, email_data, str(pdf_path))
+            # Notify the user about the unknown format so they can teach the parser
+            try:
+                from notifier import notify_unknown_format
+                notify_unknown_format(
+                    vendor=vendor_name,
+                    filename=att["filename"],
+                    subject=email_data.get("subject", ""),
+                    from_header=email_data.get("from", ""),
+                    pdf_path=str(pdf_path),
+                    error_msg=str(e),
+                )
+            except Exception as ne:
+                log.error(f"Failed to send unknown-format notification: {ne}")
             continue
 
         # Store in database
