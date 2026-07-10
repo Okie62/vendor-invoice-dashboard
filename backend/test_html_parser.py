@@ -146,3 +146,34 @@ class TestParseHtmlInvoiceDispatch:
         unknown_text = "This is not an invoice"
         with pytest.raises(ValueError, match="Unknown HTML invoice format"):
             parse_html_invoice(unknown_html, unknown_text, "Nonexistent Corp")
+
+# --- Regression: real forwarded email uses a COLUMNAR table layout ---
+# Outlook flattens the receipt table to all labels first, then all values:
+REAL_COLUMNAR_TEXT = """
+Hi Jay lamar,
+Thank you, Your Extra Space Storage Team
+YOUR RECEIPT
+Transaction Number: Payment Date: Unit: Payment Total: Next payment due on:
+381091629 07/09/2026 F277 $186.20 7/24/2026
+YOUR FACILITY Address 5802 NW 164th St Edmond, OK 73013
+"""
+
+
+class TestColumnarLayout:
+    def test_columnar_transaction_number(self):
+        p = parse_html_invoice("", REAL_COLUMNAR_TEXT, "Extra Space Storage")
+        assert p.invoice_id == "381091629"
+
+    def test_columnar_amount(self):
+        p = parse_html_invoice("", REAL_COLUMNAR_TEXT, "Extra Space Storage")
+        assert p.new_charges == 186.20
+        assert p.payment_received == 186.20
+
+    def test_columnar_date_and_period(self):
+        p = parse_html_invoice("", REAL_COLUMNAR_TEXT, "Extra Space Storage")
+        assert p.invoice_date == "07/09/2026"
+        assert p.billing_period == "07/09/2026 - 7/24/2026"
+
+    def test_columnar_unit(self):
+        p = parse_html_invoice("", REAL_COLUMNAR_TEXT, "Extra Space Storage")
+        assert p.customers[0]["account_id"] == "F277"

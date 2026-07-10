@@ -79,6 +79,32 @@ def _parse_extraspace(html_body: str, plain_text: str) -> ParsedInvoice:
     """
     text = plain_text
 
+    # --- Columnar layout (the real forwarded email) ---
+    # Outlook renders the receipt table as two columns, which flattens to:
+    #   "Transaction Number: Payment Date: Unit: Payment Total: Next payment
+    #    due on: 381091629 07/09/2026 F277 $186.20 7/24/2026"
+    # i.e. ALL labels first, then ALL values in the same order.
+    flat = re.sub(r"\s+", " ", text)
+    col_match = re.search(
+        r"Transaction\s*Number:\s*Payment\s*Date:\s*Unit:\s*Payment\s*Total:\s*"
+        r"Next\s*payment\s*due\s*on:\s*"
+        r"(\d+)\s+(\d{1,2}/\d{1,2}/\d{4})\s+(\S+)\s+\$?([\d,.]+)\s+(\d{1,2}/\d{1,2}/\d{4})",
+        flat, re.IGNORECASE,
+    )
+    if col_match:
+        invoice_id = col_match.group(1)
+        invoice_date = col_match.group(2)
+        unit = col_match.group(3)
+        amount = float(col_match.group(4).replace(",", ""))
+        next_payment_date = col_match.group(5)
+        billing_period = f"{invoice_date} - {next_payment_date}"
+        customer_match = re.search(r"Hi\s+(.+?),", text, re.IGNORECASE)
+        customer_name = customer_match.group(1).strip() if customer_match else ""
+        return _build_extraspace_invoice(
+            invoice_id, invoice_date, billing_period, amount, unit, customer_name
+        )
+
+    # --- Adjacent "Label: value" layout (fallback) ---
     # --- Receipt / Transaction ID ---
     # The plain text has structure from the email body
     # Transaction Number and values are on adjacent lines in the HTML table
@@ -125,6 +151,14 @@ def _parse_extraspace(html_body: str, plain_text: str) -> ParsedInvoice:
     customer_match = re.search(r"Hi\s+(.+?),", text, re.IGNORECASE)
     customer_name = customer_match.group(1).strip() if customer_match else ""
 
+    return _build_extraspace_invoice(
+        invoice_id, invoice_date, billing_period, amount, unit, customer_name
+    )
+
+
+def _build_extraspace_invoice(invoice_id: str, invoice_date: str, billing_period: str,
+                              amount: float, unit: str, customer_name: str) -> ParsedInvoice:
+    """Assemble a ParsedInvoice from extracted Extra Space receipt fields."""
     # Build a minimal customer record
     customers = []
     if unit or customer_name:
