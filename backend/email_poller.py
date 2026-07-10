@@ -2,8 +2,9 @@ from typing import Optional
 """
 IMAP inbox polling for vendor invoice emails.
 
-Polls a Gmail inbox for unseen emails with PDF attachments,
-extracts the attachments, and returns them for processing.
+Polls a Gmail inbox for unseen emails — with or without PDF attachments.
+HTML-only receipts are included so the ingest pipeline can parse them
+or store them as unparsed records (never silently dropped).
 
 Adapted from email-attachment-filer/email_handler.py — drops Drive API,
 OAuth, confirmation flow, and reply sending.
@@ -54,7 +55,7 @@ def connect_imap(max_retries=3):
 
 def fetch_unseen_emails(imap: imaplib.IMAP4_SSL) -> list:
     """
-    Fetch all UNSEEN emails with PDF attachments.
+    Fetch all UNSEEN emails.
 
     Returns list of dicts:
       {
@@ -63,8 +64,11 @@ def fetch_unseen_emails(imap: imaplib.IMAP4_SSL) -> list:
         "subject":      "<subject>",
         "from":         "<from header>",
         "body_text":    "<plain text body for vendor extraction>",
-        "attachments":  [{"filename": "...", "bytes": b"..."}],
+        "body_html":    "<raw HTML body (empty string if not HTML)>",
+        "attachments":  [{"filename": "...", "bytes": b"..."}],  # may be empty
       }
+    Previously, emails without PDF attachments were silently skipped.
+    Now they are included so HTML-only receipts reach the ingest pipeline.
     """
     imap.select("INBOX")
     _, data = imap.search(None, "UNSEEN")
@@ -87,12 +91,13 @@ def fetch_unseen_emails(imap: imaplib.IMAP4_SSL) -> list:
         from_header = _decode_header(msg.get("From", ""))
         date_header = msg.get("Date", "")
         body_text = _get_plain_text(msg)
+        body_html = _get_html_body(msg)
         attachments = _extract_attachments(msg)
 
         if not attachments:
-            # No PDF attachments — mark as seen and skip
-            imap.store(imap_id, "+FLAGS", "\\Seen")
-            continue
+            # No PDF attachments — include anyway for HTML-only receipts
+            # The ingest pipeline will try to parse the body or store as unparsed
+            pass
 
         results.append({
             "imap_id": imap_id,
@@ -101,10 +106,12 @@ def fetch_unseen_emails(imap: imaplib.IMAP4_SSL) -> list:
             "from": from_header,
             "received_date": _format_date(date_header),
             "body_text": body_text,
+            "body_html": body_html,
             "attachments": attachments,
         })
 
-    log.info("Fetched %d unseen email(s) with PDF attachments", len(results))
+    log.info("Fetched %d unseen email(s) (%d with PDF attachments)",
+             len(results), sum(1 for r in results if r["attachments"]))
     return results
 
 
@@ -167,6 +174,20 @@ def _get_plain_text(msg) -> str:
         return text_body
     if html_body:
         return re.sub(r"<[^>]+>", " ", html_body)
+    return ""
+
+
+def _get_html_body(msg) -> str:
+    """Return the raw HTML body of the email, or empty string."""
+    for part in msg.walk():
+        if part.get_content_disposition() == "attachment":
+            continue
+        ct = part.get_content_type()
+        if ct == "text/html":
+            payload = part.get_payload(decode=True)
+            if payload:
+                charset = part.get_content_charset() or "utf-8"
+                return payload.decode(charset, errors="replace")
     return ""
 
 

@@ -3,8 +3,8 @@ Invoice ingestion pipeline.
 
 1. Poll Gmail for unseen emails with PDF attachments
 2. Extract vendor name from email metadata
-3. Parse PDF to extract invoice data
-4. Store PDF to filesystem: data/invoices/{vendor}/{filename}
+3. Parse PDF or HTML body to extract invoice data
+4. Store PDF/HTML to filesystem: data/invoices/{vendor}/{filename}
 5. Insert invoice data into SQLite database
 6. Mark email as seen
 7. Log to processed_emails table
@@ -20,6 +20,7 @@ from db import get_db, init_db
 from email_poller import connect_imap, fetch_unseen_emails, mark_seen
 from email_sender import send_reply, extract_reply_address
 from pdf_parser import parse_pdf, ParsedInvoice
+from html_parser import parse_html_invoice
 from vendor_extractor import extract_vendor
 
 log = logging.getLogger(__name__)
@@ -61,7 +62,7 @@ def run_ingestion():
 
 
 def process_email(conn, email_data: dict):
-    """Process a single email: extract vendor, parse PDF, store."""
+    """Process a single email: extract vendor, parse attachment or HTML body, store."""
 
     # Check if already processed
     existing = conn.execute(
@@ -81,9 +82,70 @@ def process_email(conn, email_data: dict):
     # Ensure vendor exists in DB
     vendor_id = ensure_vendor(conn, vendor_name, email_data["from"])
 
-    # Process each PDF attachment
+    attachments = email_data.get("attachments", [])
+
+    if not attachments:
+        # No PDF attachments — try HTML body parsing or store as unparsed
+        _process_html_only_email(conn, vendor_id, vendor_name, email_data)
+    else:
+        # Process each PDF attachment
+        _process_pdf_attachments(conn, vendor_id, vendor_name, email_data, attachments)
+
+
+def _process_html_only_email(conn, vendor_id: int, vendor_name: str, email_data: dict):
+    """Process an email with no PDF attachments via HTML body parsing."""
+    body_html = email_data.get("body_html", "")
+    body_text = email_data.get("body_text", "")
+
+    if not body_html:
+        log.warning(f"No HTML body in email {email_data['message_id']} — storing as unparsed.")
+        _store_html_as_unparsed(conn, vendor_id, email_data, body_text, "no_body")
+        _notify_unknown_format(vendor_name, "no_body", email_data, "Email has no HTML body")
+        return
+
+    # Save HTML body to filesystem
+    safe_vendor = re.sub(r"[^a-zA-Z0-9]+", "_", vendor_name).strip("_")
+    html_dir = INVOICE_DIR / safe_vendor
+    html_dir.mkdir(parents=True, exist_ok=True)
+
+    # Generate a filename from subject/message_id
+    safe_subj = re.sub(r"[^a-zA-Z0-9]+", "_", email_data.get("subject", "receipt"))[:40]
+    html_filename = f"{safe_subj}_{datetime.now().strftime('%Y%m%d%H%M%S')}.html"
+    html_path = html_dir / html_filename
+    html_path.write_text(body_html, encoding="utf-8")
+    log.info(f"Saved HTML body: {html_path}")
+
+    # Try to parse the HTML body
+    try:
+        parsed = parse_html_invoice(body_html, body_text, vendor_name)
+    except ValueError as e:
+        log.warning(f"Could not parse HTML receipt: {e} — storing as unparsed.")
+        _store_html_as_unparsed(conn, vendor_id, email_data, str(html_path), body_text)
+        _notify_unknown_format(vendor_name, html_filename, email_data, str(e))
+        return
+
+    # Store parsed invoice
+    store_invoice(
+        conn, vendor_id, parsed, str(html_path),
+        email_data["message_id"], source="email_html"
+    )
+    _send_new_invoice_notification(parsed, vendor_name)
+    _send_confirmation_reply(email_data, [parsed], vendor_name)
+
+    # Log to processed_emails
+    conn.execute(
+        "INSERT OR REPLACE INTO processed_emails "
+        "(message_id, vendor_name, filename, processed_at) "
+        "VALUES (?, ?, ?, datetime('now'))",
+        (email_data["message_id"], vendor_name, html_filename)
+    )
+    conn.commit()
+
+
+def _process_pdf_attachments(conn, vendor_id, vendor_name, email_data, attachments):
+    """Process email with PDF attachments (existing behavior)."""
     parsed_invoices = []  # track for reply
-    for att in email_data["attachments"]:
+    for att in attachments:
         # Save PDF to filesystem
         pdf_dir = INVOICE_DIR / vendor_name
         pdf_dir.mkdir(parents=True, exist_ok=True)
@@ -97,19 +159,7 @@ def process_email(conn, email_data: dict):
         except ValueError as e:
             log.warning(f"Could not parse {att['filename']}: {e} — storing as unstructured.")
             store_unparsed_invoice(conn, vendor_id, email_data, str(pdf_path))
-            # Notify the user about the unknown format so they can teach the parser
-            try:
-                from notifier import notify_unknown_format
-                notify_unknown_format(
-                    vendor=vendor_name,
-                    filename=att["filename"],
-                    subject=email_data.get("subject", ""),
-                    from_header=email_data.get("from", ""),
-                    pdf_path=str(pdf_path),
-                    error_msg=str(e),
-                )
-            except Exception as ne:
-                log.error(f"Failed to send unknown-format notification: {ne}")
+            _notify_unknown_format(vendor_name, att["filename"], email_data, str(e))
             continue
 
         # Store in database
@@ -119,39 +169,14 @@ def process_email(conn, email_data: dict):
         )
         parsed_invoices.append(parsed)
 
-        # Send notification (#21)
-        try:
-            from notifier import notify_new_invoice
-            notify_new_invoice(
-                parsed.invoice_id, vendor_name,
-                parsed.outstanding_balance or parsed.new_charges,
-                parsed.billing_period
-            )
-        except Exception as e:
-            log.warning(f"Notification failed: {e}")
+        _send_new_invoice_notification(parsed, vendor_name)
 
     # Send confirmation reply
     if parsed_invoices:
-        reply_addr = extract_reply_address(email_data.get("from", ""))
-        if reply_addr:
-            # Use first parsed invoice for the reply summary
-            p = parsed_invoices[0]
-            send_reply(
-                to_addr=reply_addr,
-                original_subject=email_data.get("subject", ""),
-                invoice_id=p.invoice_id,
-                vendor=vendor_name,
-                amount=p.outstanding_balance or p.new_charges,
-                billing_period=p.billing_period,
-                received_date=email_data.get("received_date", ""),
-                attachment_count=len(email_data["attachments"]),
-            )
-        else:
-            log.warning("No reply address found in From header — skipping reply")
+        _send_confirmation_reply(email_data, parsed_invoices, vendor_name)
 
     # Log to processed_emails
-    # Store all attachment filenames (#17 — was only logging first)
-    all_filenames = ", ".join(a["filename"] for a in email_data["attachments"])
+    all_filenames = ", ".join(a["filename"] for a in attachments)
     conn.execute(
         "INSERT OR REPLACE INTO processed_emails "
         "(message_id, vendor_name, filename, processed_at) "
@@ -159,6 +184,67 @@ def process_email(conn, email_data: dict):
         (email_data["message_id"], vendor_name, all_filenames)
     )
     conn.commit()
+
+
+def _store_html_as_unparsed(conn, vendor_id, email_data, html_path, body_text):
+    """Store an unparsed HTML-only receipt (no PDF)."""
+    inv_id = f"unparsed_{datetime.now().strftime('%Y%m%d%H%M%S')}"
+    conn.execute("""
+        INSERT INTO invoices
+        (id, vendor_id, source, email_message_id, pdf_path, new_charges, outstanding_balance)
+        VALUES (?, ?, 'email_unparsed', ?, ?, 0, 0)
+    """, (inv_id, vendor_id, email_data["message_id"], html_path))
+    conn.commit()
+    log.info(f"Stored unparsed HTML invoice {inv_id} (body at {html_path})")
+
+
+def _notify_unknown_format(vendor_name, filename, email_data, error_msg=""):
+    """Send notification about an unparseable invoice."""
+    try:
+        from notifier import notify_unknown_format
+        notify_unknown_format(
+            vendor=vendor_name,
+            filename=filename,
+            subject=email_data.get("subject", ""),
+            from_header=email_data.get("from", ""),
+            pdf_path=str(INVOICE_DIR / vendor_name / filename) if filename != "no_body" else "",
+            error_msg=error_msg,
+        )
+    except Exception as ne:
+        log.error(f"Failed to send unknown-format notification: {ne}")
+
+
+def _send_new_invoice_notification(parsed: ParsedInvoice, vendor_name: str):
+    """Send notification about a new invoice."""
+    try:
+        from notifier import notify_new_invoice
+        notify_new_invoice(
+            parsed.invoice_id, vendor_name,
+            parsed.outstanding_balance or parsed.new_charges,
+            parsed.billing_period
+        )
+    except Exception as e:
+        log.warning(f"Notification failed: {e}")
+
+
+def _send_confirmation_reply(email_data, parsed_invoices, vendor_name):
+    """Send a confirmation reply email."""
+    from email_sender import send_reply, extract_reply_address
+    reply_addr = extract_reply_address(email_data.get("from", ""))
+    if reply_addr:
+        p = parsed_invoices[0]
+        send_reply(
+            to_addr=reply_addr,
+            original_subject=email_data.get("subject", ""),
+            invoice_id=p.invoice_id,
+            vendor=vendor_name,
+            amount=p.outstanding_balance or p.new_charges,
+            billing_period=p.billing_period,
+            received_date=email_data.get("received_date", ""),
+            attachment_count=len(parsed_invoices),
+        )
+    else:
+        log.warning("No reply address found in From header — skipping reply")
 
 
 def ensure_vendor(conn, name: str, from_header: str) -> int:

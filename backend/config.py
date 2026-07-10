@@ -73,6 +73,8 @@ VENDOR_ALIASES = {
     "barracuda":     "Barracuda",
     "flyover":       "Flyover Software",
     "btabs":         "Flyover Software",
+    "extraspace":    "Extra Space Storage",
+    "compassmining": "Compass Mining",
 }
 
 # Noise subdomain prefixes to strip
