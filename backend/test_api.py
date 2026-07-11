@@ -461,3 +461,269 @@ class TestReviewQueueAPI:
         fmt = next(f for f in data if f["vendor_name"] == "FormatListVendor")
         assert fmt["format_fingerprint"] == fp
         assert fmt["status"] == "new"
+
+
+class TestInvoiceStatus:
+    """Tests for A/P invoice status lifecycle endpoints."""
+
+    def test_update_status(self, client, auth_headers):
+        from db import get_db
+        conn = get_db()
+        cursor = conn.execute(
+            "INSERT INTO vendors (name) VALUES (?)", ("StatusVendor",)
+        )
+        vendor_id = cursor.lastrowid
+        conn.execute(
+            "INSERT INTO invoices (id, vendor_id, source, new_charges, outstanding_balance) "
+            "VALUES (?, ?, 'manual', 100, 50)",
+            ("inv_status_1", vendor_id)
+        )
+        conn.commit()
+        conn.close()
+
+        resp = client.patch(
+            "/api/invoices/inv_status_1/status",
+            headers=auth_headers,
+            json={"status": "approved"}
+        )
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["success"] is True
+        assert data["changes"]["status"]["to"] == "approved"
+
+        # Verify DB
+        conn = get_db()
+        inv = conn.execute(
+            "SELECT status FROM invoices WHERE id = ?", ("inv_status_1",)
+        ).fetchone()
+        assert inv["status"] == "approved"
+        conn.close()
+
+    def test_update_status_invalid(self, client, auth_headers):
+        resp = client.patch(
+            "/api/invoices/nonexistent/status",
+            headers=auth_headers,
+            json={"status": "approved"}
+        )
+        assert resp.status_code == 404
+
+    def test_update_status_bad_value(self, client, auth_headers):
+        from db import get_db
+        conn = get_db()
+        cursor = conn.execute(
+            "INSERT INTO vendors (name) VALUES (?)", ("BadValVendor",)
+        )
+        vendor_id = cursor.lastrowid
+        conn.execute(
+            "INSERT INTO invoices (id, vendor_id, source, new_charges, outstanding_balance) "
+            "VALUES (?, ?, 'manual', 100, 50)",
+            ("inv_bad_status", vendor_id)
+        )
+        conn.commit()
+        conn.close()
+
+        resp = client.patch(
+            "/api/invoices/inv_bad_status/status",
+            headers=auth_headers,
+            json={"status": "invalid_status"}
+        )
+        assert resp.status_code == 400
+
+    def test_bulk_update_status(self, client, auth_headers):
+        from db import get_db
+        conn = get_db()
+        cursor = conn.execute(
+            "INSERT INTO vendors (name) VALUES (?)", ("BulkVendor",)
+        )
+        vendor_id = cursor.lastrowid
+        ids = ["inv_bulk_1", "inv_bulk_2", "inv_bulk_3"]
+        for i, inv_id in enumerate(ids):
+            conn.execute(
+                "INSERT INTO invoices (id, vendor_id, source, new_charges, outstanding_balance) "
+                "VALUES (?, ?, 'manual', 100, 50)",
+                (inv_id, vendor_id)
+            )
+        conn.commit()
+        conn.close()
+
+        resp = client.patch(
+            "/api/invoices/bulk-status",
+            headers=auth_headers,
+            json={"ids": ids, "status": "approved"}
+        )
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["success"] is True
+        assert data["updated"] == 3
+
+        # Verify all updated
+        conn = get_db()
+        for inv_id in ids:
+            inv = conn.execute(
+                "SELECT status FROM invoices WHERE id = ?", (inv_id,)
+            ).fetchone()
+            assert inv["status"] == "approved"
+        conn.close()
+
+    def test_bulk_status_requires_admin(self, client):
+        """Register admin + non-admin to verify admin gate works."""
+        # First register the first user (becomes admin automatically)
+        resp = client.post("/api/auth/register", json={
+            "email": "admin_bulk@test.com",
+            "password": "TestPass123!",
+            "full_name": "AdminUser"
+        })
+        assert resp.status_code == 201
+        # Now register a second user (NOT admin)
+        resp = client.post("/api/auth/register", json={
+            "email": "nonadmin_bulk@test.com",
+            "password": "TestPass123!",
+            "full_name": "NonAdminUser"
+        })
+        assert resp.status_code == 201, f"Failed to register: {resp.get_json()}"
+        data = resp.get_json()
+        assert data["user"]["is_admin"] is False, "Second user should not be admin"
+        headers = {"Authorization": f"Bearer {data['access_token']}"}
+
+        resp = client.patch(
+            "/api/invoices/bulk-status",
+            headers=headers,
+            json={"ids": ["x"], "status": "paid"}
+        )
+        assert resp.status_code == 403
+
+
+class TestVendorDetail:
+    """Tests for vendor detail with rollups."""
+
+    def test_vendor_detail_with_rollups(self, client, auth_headers):
+        from db import get_db
+        conn = get_db()
+        cursor = conn.execute(
+            "INSERT INTO vendors (name, email_domain) VALUES (?, ?)",
+            ("DetailVendor", "detail.com")
+        )
+        vendor_id = cursor.lastrowid
+        conn.execute(
+            "INSERT INTO invoices (id, vendor_id, source, new_charges, outstanding_balance, "
+            "payment_received, status, due_date) "
+            "VALUES (?, ?, 'manual', 1000, 500, 200, 'received', '2026-07-15')",
+            ("inv_detail_1", vendor_id)
+        )
+        conn.execute(
+            "INSERT INTO invoices (id, vendor_id, source, new_charges, outstanding_balance, "
+            "payment_received, status, due_date) "
+            "VALUES (?, ?, 'manual', 2000, 0, 2000, 'paid', '2026-06-01')",
+            ("inv_detail_2", vendor_id)
+        )
+        conn.commit()
+        conn.close()
+
+        resp = client.get(f"/api/vendors/{vendor_id}", headers=auth_headers)
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["vendor"]["name"] == "DetailVendor"
+        assert data["totals"]["invoice_count"] == 2
+        assert data["totals"]["total_new_charges"] == 3000
+        assert data["totals"]["total_outstanding"] == 500
+        assert len(data["invoices"]) == 2
+        assert len(data["formats"]) == 0
+
+    def test_vendor_detail_not_found(self, client, auth_headers):
+        resp = client.get("/api/vendors/99999", headers=auth_headers)
+        assert resp.status_code == 404
+
+
+class TestDashboardEndpoint:
+    """Tests for the A/P dashboard summary endpoint."""
+
+    def test_dashboard_returns_summary(self, client, auth_headers):
+        from db import get_db
+        conn = get_db()
+        cursor = conn.execute(
+            "INSERT INTO vendors (name) VALUES (?)", ("DashVendor_uniq",)
+        )
+        vendor_id = cursor.lastrowid
+        conn.execute(
+            "INSERT INTO invoices (id, vendor_id, source, new_charges, outstanding_balance, "
+            "status, due_date, created_at) "
+            "VALUES (?, ?, 'manual', 1000, 500, 'received', '2026-07-15', '2026-07-10')",
+            ("inv_dash_rec", vendor_id)
+        )
+        conn.execute(
+            "INSERT INTO invoices (id, vendor_id, source, new_charges, outstanding_balance, "
+            "status, due_date, created_at) "
+            "VALUES (?, ?, 'manual', 2000, 0, 'paid', '2026-06-01', '2026-07-11')",
+            ("inv_dash_paid", vendor_id)
+        )
+        conn.commit()
+        conn.close()
+
+        resp = client.get("/api/dashboard", headers=auth_headers)
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert "summary" in data
+        assert "aging" in data
+        assert "recent_invoices" in data
+        assert "monthly_spend" in data
+        assert "status_counts" in data
+
+
+class TestInvoiceFilters:
+    """Tests for enhanced invoice filtering."""
+
+    def test_filter_by_status(self, client, auth_headers):
+        from db import get_db
+        conn = get_db()
+        cursor = conn.execute(
+            "INSERT INTO vendors (name) VALUES (?)", ("FilterVendor_xyz123",)
+        )
+        vendor_id = cursor.lastrowid
+        conn.execute(
+            "INSERT INTO invoices (id, vendor_id, source, new_charges, outstanding_balance, status) "
+            "VALUES (?, ?, 'manual', 100, 50, 'received')",
+            ("inv_filt_rec_1", vendor_id)
+        )
+        conn.execute(
+            "INSERT INTO invoices (id, vendor_id, source, new_charges, outstanding_balance, status) "
+            "VALUES (?, ?, 'manual', 200, 100, 'approved')",
+            ("inv_filt_app_1", vendor_id)
+        )
+        conn.commit()
+        conn.close()
+
+        resp = client.get("/api/invoices?status=approved&vendor=FilterVendor_xyz123", headers=auth_headers)
+        assert resp.status_code == 200
+        data = resp.get_json()
+        # At least our approved invoice is in the results
+        ids = [d["id"] for d in data]
+        assert "inv_filt_app_1" in ids
+        assert "inv_filt_rec_1" not in ids
+
+    def test_sort_by_due_date(self, client, auth_headers):
+        from db import get_db
+        conn = get_db()
+        cursor = conn.execute(
+            "INSERT INTO vendors (name) VALUES (?)", ("SortVendor_xyz789",)
+        )
+        vendor_id = cursor.lastrowid
+        conn.execute(
+            "INSERT INTO invoices (id, vendor_id, source, new_charges, outstanding_balance, "
+            "status, due_date) VALUES (?, ?, 'manual', 100, 50, 'received', '2026-08-01')",
+            ("inv_sort_aug", vendor_id)
+        )
+        conn.execute(
+            "INSERT INTO invoices (id, vendor_id, source, new_charges, outstanding_balance, "
+            "status, due_date) VALUES (?, ?, 'manual', 200, 100, 'received', '2026-07-01')",
+            ("inv_sort_jul", vendor_id)
+        )
+        conn.commit()
+        conn.close()
+
+        resp = client.get("/api/invoices?sort_field=due_date&sort_dir=asc&vendor=SortVendor_xyz789", headers=auth_headers)
+        assert resp.status_code == 200
+        data = resp.get_json()
+        # Should be sorted by due_date asc, so inv_sort_jul (2026-07-01) first
+        assert len(data) == 2
+        assert data[0]["id"] == "inv_sort_jul"
+        assert data[1]["id"] == "inv_sort_aug"

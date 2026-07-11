@@ -172,6 +172,18 @@ MIGRATIONS = [
     "detection_reason TEXT, "
     "reviewed_by INTEGER REFERENCES users(id), "
     "reviewed_at TEXT)",
+
+    # v5: add status column for A/P invoice lifecycle
+    "ALTER TABLE invoices ADD COLUMN status TEXT NOT NULL DEFAULT 'received' "
+    "CHECK(status IN ('received', 'needs_review', 'approved', 'scheduled', 'paid'))",
+
+    # v6: add due_date column for A/P aging
+    "ALTER TABLE invoices ADD COLUMN due_date TEXT",
+
+    # v7: derive sensible defaults for existing rows
+    "UPDATE invoices SET status = 'paid' WHERE outstanding_balance = 0 AND status = 'received'",
+
+    "UPDATE invoices SET status = 'needs_review' WHERE source = 'email_unparsed' AND status = 'received'",
 ]
 
 

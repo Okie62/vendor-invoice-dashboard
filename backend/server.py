@@ -308,19 +308,36 @@ def get_vendors():
 @app.route("/api/invoices")
 @require_auth
 def get_invoices():
-    """Get invoices with optional vendor and date filtering (#7).
+    """Get invoices with optional filters including status, due_date, vendor, and date range.
 
     Query params:
       vendor — filter by vendor name
       start  — billing_period >= start (ISO date or 'Mon DD, YYYY')
       end    — billing_period <= end
       search — search invoice_id or billing_period (#29)
+      status — filter by status (received|needs_review|approved|scheduled|paid)
+      due_from — due_date >=
+      due_to   — due_date <=
+      sort_field — sort column (created_at|invoice_date|due_date|outstanding_balance|status)
+      sort_dir — asc|desc (default desc)
     """
     conn = get_db()
     vendor = request.args.get("vendor")
     start_date = request.args.get("start")
     end_date = request.args.get("end")
     search = request.args.get("search", "").strip()
+    status_filter = request.args.get("status", "").strip()
+    due_from = request.args.get("due_from", "").strip()
+    due_to = request.args.get("due_to", "").strip()
+    sort_field = request.args.get("sort_field", "created_at")
+    sort_dir = request.args.get("sort_dir", "desc")
+
+    # Validate sort
+    allowed_sorts = {"created_at", "invoice_date", "due_date", "outstanding_balance", "status", "billing_period"}
+    if sort_field not in allowed_sorts:
+        sort_field = "created_at"
+    if sort_dir not in ("asc", "desc"):
+        sort_dir = "desc"
 
     query = (
         "SELECT i.*, v.name as vendor_name FROM invoices i "
@@ -339,7 +356,16 @@ def get_invoices():
     if search:
         query += " AND (i.id LIKE ? OR i.billing_period LIKE ?)"
         params.extend([f"%{search}%", f"%{search}%"])
-    query += " ORDER BY i.created_at DESC"
+    if status_filter:
+        query += " AND i.status = ?"
+        params.append(status_filter)
+    if due_from:
+        query += " AND i.due_date >= ?"
+        params.append(due_from)
+    if due_to:
+        query += " AND i.due_date <= ?"
+        params.append(due_to)
+    query += f" ORDER BY i.{sort_field} {sort_dir.upper()}"
 
     rows = conn.execute(query, params).fetchall()
     conn.close()
@@ -656,7 +682,8 @@ def update_invoice(invoice_id):
             "billing_period", "invoice_date", "is_credit_memo", "references_invoice",
             "partner_name", "partner_id", "partner_username",
             "previous_balance", "credit_card_surcharges",
-            "payment_received", "new_charges", "outstanding_balance"
+            "payment_received", "new_charges", "outstanding_balance",
+            "status", "due_date",
         }
         sets = []
         values = []
@@ -902,6 +929,63 @@ def update_vendor(vendor_id):
     return jsonify({"success": True})
 
 
+@app.route("/api/vendors/<int:vendor_id>")
+@require_auth
+def get_vendor_detail(vendor_id):
+    """Get vendor detail with rollups: invoice count, totals, aging summary."""
+    conn = get_db()
+    vendor = conn.execute(
+        "SELECT * FROM vendors WHERE id = ?", (vendor_id,)
+    ).fetchone()
+    if not vendor:
+        conn.close()
+        abort(404)
+
+    # Totals
+    totals = conn.execute(
+        "SELECT COUNT(*) as invoice_count, "
+        "COALESCE(SUM(new_charges), 0) as total_new_charges, "
+        "COALESCE(SUM(outstanding_balance), 0) as total_outstanding, "
+        "COALESCE(SUM(payment_received), 0) as total_paid "
+        "FROM invoices WHERE vendor_id = ?",
+        (vendor_id,)
+    ).fetchone()
+
+    # Aging buckets
+    aging = conn.execute(
+        "SELECT "
+        "COALESCE(SUM(CASE WHEN due_date IS NULL AND status != 'paid' THEN outstanding_balance ELSE 0 END), 0) as no_due_date, "
+        "COALESCE(SUM(CASE WHEN due_date >= date('now') AND status != 'paid' THEN outstanding_balance ELSE 0 END), 0) as current, "
+        "COALESCE(SUM(CASE WHEN due_date < date('now') AND due_date >= date('now', '-30 days') AND status != 'paid' THEN outstanding_balance ELSE 0 END), 0) as days_1_30, "
+        "COALESCE(SUM(CASE WHEN due_date < date('now', '-30 days') AND due_date >= date('now', '-60 days') AND status != 'paid' THEN outstanding_balance ELSE 0 END), 0) as days_31_60, "
+        "COALESCE(SUM(CASE WHEN due_date < date('now', '-60 days') AND due_date >= date('now', '-90 days') AND status != 'paid' THEN outstanding_balance ELSE 0 END), 0) as days_61_90, "
+        "COALESCE(SUM(CASE WHEN due_date < date('now', '-90 days') AND status != 'paid' THEN outstanding_balance ELSE 0 END), 0) as days_90_plus "
+        "FROM invoices WHERE vendor_id = ?",
+        (vendor_id,)
+    ).fetchone()
+
+    # Recent invoices
+    invoices = conn.execute(
+        "SELECT i.* FROM invoices i WHERE i.vendor_id = ? ORDER BY i.created_at DESC LIMIT 50",
+        (vendor_id,)
+    ).fetchall()
+
+    # Registered formats
+    formats = conn.execute(
+        "SELECT f.* FROM invoice_formats f WHERE f.vendor_id = ? ORDER BY f.last_seen DESC",
+        (vendor_id,)
+    ).fetchall()
+
+    conn.close()
+
+    return jsonify({
+        "vendor": dict(vendor),
+        "totals": dict(totals),
+        "aging": dict(aging),
+        "invoices": [dict(r) for r in invoices],
+        "formats": [dict(r) for r in formats],
+    })
+
 @app.route("/api/vendors/<int:vendor_id>", methods=["DELETE"])
 @require_auth
 def delete_vendor(vendor_id):
@@ -922,6 +1006,161 @@ def delete_vendor(vendor_id):
 # ---------------------------------------------------------------------------
 # Audit log (#20)
 # ---------------------------------------------------------------------------
+
+
+@app.route("/api/invoices/<invoice_id>/status", methods=["PATCH"])
+@require_admin
+def update_invoice_status(invoice_id):
+    """Update an invoice's status (admin only)."""
+    data = request.get_json() or {}
+    new_status = data.get("status", "").strip()
+    due_date = data.get("due_date", "").strip()
+
+    valid_statuses = {"received", "needs_review", "approved", "scheduled", "paid"}
+    if new_status and new_status not in valid_statuses:
+        return jsonify({"error": f"Invalid status. Must be one of: {', '.join(sorted(valid_statuses))}"}), 400
+
+    conn = get_db()
+    inv = conn.execute(
+        "SELECT id, status, vendor_id FROM invoices WHERE id = ?", (invoice_id,)
+    ).fetchone()
+    if not inv:
+        conn.close()
+        abort(404)
+
+    changes = {}
+    if new_status and new_status != inv["status"]:
+        conn.execute("UPDATE invoices SET status = ? WHERE id = ?", (new_status, invoice_id))
+        changes["status"] = {"from": inv["status"], "to": new_status}
+    if due_date:
+        conn.execute("UPDATE invoices SET due_date = ? WHERE id = ?", (due_date, invoice_id))
+        changes["due_date"] = {"set": due_date}
+        if "status" not in changes:
+            changes["due_date"] = {"set": due_date}
+
+    if changes:
+        from db import log_audit
+        user_email = getattr(g, 'current_user_email', '') or ''
+        log_audit(conn, invoice_id, g.current_user_id, user_email,
+                  "update_status", changes)
+    conn.commit()
+    conn.close()
+
+    return jsonify({"success": True, "changes": changes})
+
+
+@app.route("/api/invoices/bulk-status", methods=["PATCH"])
+@require_admin
+def bulk_update_status():
+    """Bulk update invoice statuses (admin only).
+    Body: { "ids": ["inv1", "inv2", ...], "status": "paid" }
+    """
+    data = request.get_json() or {}
+    ids = data.get("ids", [])
+    new_status = data.get("status", "").strip()
+    due_date = data.get("due_date", "").strip()
+
+    if not ids:
+        return jsonify({"error": "No invoice IDs provided"}), 400
+    valid_statuses = {"received", "needs_review", "approved", "scheduled", "paid"}
+    if new_status not in valid_statuses:
+        return jsonify({"error": f"Invalid status. Must be one of: {', '.join(sorted(valid_statuses))}"}), 400
+
+    conn = get_db()
+    placeholders = ",".join("?" * len(ids))
+    updated = 0
+    for inv_id in ids:
+        inv = conn.execute("SELECT id, status FROM invoices WHERE id = ?", (inv_id,)).fetchone()
+        if inv and inv["status"] != new_status:
+            conn.execute("UPDATE invoices SET status = ? WHERE id = ?", (new_status, inv_id))
+            if due_date:
+                conn.execute("UPDATE invoices SET due_date = ? WHERE id = ?", (due_date, inv_id))
+            from db import log_audit
+            user_email = getattr(g, 'current_user_email', '') or ''
+            log_audit(conn, inv_id, g.current_user_id, user_email,
+                      "bulk_update_status", {"status": {"from": inv["status"], "to": new_status}})
+            updated += 1
+    conn.commit()
+    conn.close()
+
+    return jsonify({"success": True, "updated": updated})
+
+
+@app.route("/api/dashboard")
+@require_auth
+def get_dashboard():
+    """A/P dashboard summary with aging buckets."""
+    conn = get_db()
+
+    # Summary cards
+    total_outstanding = conn.execute(
+        "SELECT COALESCE(SUM(outstanding_balance), 0) as val FROM invoices WHERE status != 'paid'"
+    ).fetchone()["val"]
+
+    due_soon = conn.execute(
+        "SELECT COALESCE(SUM(outstanding_balance), 0) as val FROM invoices "
+        "WHERE due_date IS NOT NULL AND due_date <= date('now', '+7 days') AND due_date >= date('now') AND status != 'paid'"
+    ).fetchone()["val"]
+
+    overdue = conn.execute(
+        "SELECT COALESCE(SUM(outstanding_balance), 0) as val FROM invoices "
+        "WHERE due_date < date('now') AND status != 'paid'"
+    ).fetchone()["val"]
+
+    paid_this_month = conn.execute(
+        "SELECT COALESCE(SUM(outstanding_balance), 0) as val FROM invoices "
+        "WHERE status = 'paid' AND created_at >= date('now', 'start of month')"
+    ).fetchone()["val"]
+
+    # A/P aging buckets
+    aging = conn.execute(
+        "SELECT "
+        "COALESCE(SUM(CASE WHEN due_date IS NULL AND status != 'paid' THEN outstanding_balance ELSE 0 END), 0) as no_due_date, "
+        "COALESCE(SUM(CASE WHEN due_date >= date('now') AND status != 'paid' THEN outstanding_balance ELSE 0 END), 0) as current, "
+        "COALESCE(SUM(CASE WHEN due_date < date('now') AND due_date >= date('now', '-30 days') AND status != 'paid' THEN outstanding_balance ELSE 0 END), 0) as days_1_30, "
+        "COALESCE(SUM(CASE WHEN due_date < date('now', '-30 days') AND due_date >= date('now', '-60 days') AND status != 'paid' THEN outstanding_balance ELSE 0 END), 0) as days_31_60, "
+        "COALESCE(SUM(CASE WHEN due_date < date('now', '-60 days') AND due_date >= date('now', '-90 days') AND status != 'paid' THEN outstanding_balance ELSE 0 END), 0) as days_61_90, "
+        "COALESCE(SUM(CASE WHEN due_date < date('now', '-90 days') AND status != 'paid' THEN outstanding_balance ELSE 0 END), 0) as days_90_plus "
+        "FROM invoices"
+    ).fetchone()
+
+    # Recent invoices
+    recent = conn.execute(
+        "SELECT i.*, v.name as vendor_name FROM invoices i "
+        "JOIN vendors v ON i.vendor_id = v.id "
+        "ORDER BY i.created_at DESC LIMIT 10"
+    ).fetchall()
+
+    # Monthly spend trend (last 12 months)
+    monthly_spend = conn.execute(
+        "SELECT substr(i.created_at, 1, 7) as month, "
+        "COALESCE(SUM(i.new_charges), 0) as total_charges, "
+        "COALESCE(SUM(i.outstanding_balance), 0) as total_outstanding "
+        "FROM invoices i "
+        "WHERE i.created_at >= date('now', '-12 months') "
+        "GROUP BY substr(i.created_at, 1, 7) "
+        "ORDER BY month"
+    ).fetchall()
+
+    # Status counts
+    status_counts = conn.execute(
+        "SELECT status, COUNT(*) as count FROM invoices GROUP BY status"
+    ).fetchall()
+
+    conn.close()
+
+    return jsonify({
+        "summary": {
+            "total_outstanding": total_outstanding,
+            "due_soon": due_soon,
+            "overdue": overdue,
+            "paid_this_month": paid_this_month,
+        },
+        "aging": dict(aging),
+        "recent_invoices": [dict(r) for r in recent],
+        "monthly_spend": [dict(r) for r in monthly_spend],
+        "status_counts": [dict(r) for r in status_counts],
+    })
 
 @app.route("/api/invoices/<invoice_id>/audit")
 @require_auth
@@ -1210,6 +1449,7 @@ def extract_and_verify(review_id):
         "partner_name", "partner_id", "partner_username",
         "previous_balance", "credit_card_surcharges",
         "payment_received", "new_charges", "outstanding_balance",
+        "status", "due_date",
     }
     invoice_sets = []
     invoice_values = []
