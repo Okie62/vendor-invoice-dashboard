@@ -8,6 +8,7 @@ Invoice ingestion pipeline.
 5. Insert invoice data into SQLite database
 6. Mark email as seen
 7. Log to processed_emails table
+8. Detect new formats and create review queue entries
 """
 
 import logging
@@ -22,6 +23,10 @@ from email_sender import send_reply, extract_reply_address
 from pdf_parser import parse_pdf, ParsedInvoice
 from html_parser import parse_html_invoice
 from vendor_extractor import extract_vendor
+from format_recognition import (
+    compute_fingerprint, register_format, is_recognized_format,
+    create_review,
+)
 
 log = logging.getLogger(__name__)
 
@@ -99,8 +104,10 @@ def _process_html_only_email(conn, vendor_id: int, vendor_name: str, email_data:
 
     if not body_html:
         log.warning(f"No HTML body in email {email_data['message_id']} — storing as unparsed.")
-        _store_html_as_unparsed(conn, vendor_id, email_data, body_text, "no_body")
+        inv_id = _store_html_as_unparsed(conn, vendor_id, email_data, body_text, "no_body")
         _notify_unknown_format(vendor_name, "no_body", email_data, "Email has no HTML body")
+        if inv_id:
+            create_review(conn, inv_id, vendor_id, "no_body")
         return
 
     # Save HTML body to filesystem
@@ -120,8 +127,11 @@ def _process_html_only_email(conn, vendor_id: int, vendor_name: str, email_data:
         parsed = parse_html_invoice(body_html, body_text, vendor_name)
     except ValueError as e:
         log.warning(f"Could not parse HTML receipt: {e} — storing as unparsed.")
-        _store_html_as_unparsed(conn, vendor_id, email_data, str(html_path), body_text)
+        inv_id = _store_html_as_unparsed(conn, vendor_id, email_data, str(html_path), body_text)
         _notify_unknown_format(vendor_name, html_filename, email_data, str(e))
+        if inv_id:
+            create_review(conn, inv_id, vendor_id, "no_parser",
+                          extracted_data={"vendor": vendor_name, "filename": html_filename})
         return
 
     # Store parsed invoice
@@ -129,6 +139,16 @@ def _process_html_only_email(conn, vendor_id: int, vendor_name: str, email_data:
         conn, vendor_id, parsed, str(html_path),
         email_data["message_id"], source="email_html"
     )
+
+    # ---- Format recognition for parsed HTML invoices ----
+    fp = compute_fingerprint(body_html + "\n" + body_text)
+    reg = register_format(conn, vendor_id, fp, "html_parser")
+    if reg["is_new"]:
+        log.info("New HTML format fingerprint registered for vendor %s", vendor_name)
+        create_review(conn, parsed.invoice_id, vendor_id, "new_format",
+                      extracted_data={"vendor": vendor_name, "fingerprint": fp})
+    # ----------------------------------------------------
+
     _send_new_invoice_notification(parsed, vendor_name)
     _send_confirmation_reply(email_data, [parsed], vendor_name)
 
@@ -143,7 +163,7 @@ def _process_html_only_email(conn, vendor_id: int, vendor_name: str, email_data:
 
 
 def _process_pdf_attachments(conn, vendor_id, vendor_name, email_data, attachments):
-    """Process email with PDF attachments (existing behavior)."""
+    """Process email with PDF attachments — parse, store, and detect new formats."""
     parsed_invoices = []  # track for reply
     for att in attachments:
         # Save PDF to filesystem
@@ -158,8 +178,11 @@ def _process_pdf_attachments(conn, vendor_id, vendor_name, email_data, attachmen
             parsed = parse_pdf(str(pdf_path))
         except ValueError as e:
             log.warning(f"Could not parse {att['filename']}: {e} — storing as unstructured.")
-            store_unparsed_invoice(conn, vendor_id, email_data, str(pdf_path))
+            inv_id = store_unparsed_invoice(conn, vendor_id, email_data, str(pdf_path))
             _notify_unknown_format(vendor_name, att["filename"], email_data, str(e))
+            if inv_id:
+                create_review(conn, inv_id, vendor_id, "no_parser",
+                              extracted_data={"vendor": vendor_name, "filename": att["filename"]})
             continue
 
         # Store in database
@@ -168,6 +191,23 @@ def _process_pdf_attachments(conn, vendor_id, vendor_name, email_data, attachmen
             email_data["message_id"], source="email"
         )
         parsed_invoices.append(parsed)
+
+        # ---- Format recognition for parsed PDF invoices ----
+        # Extract raw text for fingerprinting
+        import pymupdf
+        try:
+            doc = pymupdf.open(str(pdf_path))
+            raw_text = "\n".join(page.get_text() for page in doc)
+            doc.close()
+            fp = compute_fingerprint(raw_text)
+            reg = register_format(conn, vendor_id, fp, "pdf_parser")
+            if reg["is_new"]:
+                log.info("New PDF format fingerprint registered for vendor %s", vendor_name)
+                create_review(conn, parsed.invoice_id, vendor_id, "new_format",
+                              extracted_data={"vendor": vendor_name, "fingerprint": fp})
+        except Exception as e:
+            log.warning("Format fingerprinting failed for %s: %s", att["filename"], e)
+        # ----------------------------------------------------
 
         _send_new_invoice_notification(parsed, vendor_name)
 
@@ -187,7 +227,7 @@ def _process_pdf_attachments(conn, vendor_id, vendor_name, email_data, attachmen
 
 
 def _store_html_as_unparsed(conn, vendor_id, email_data, html_path, body_text):
-    """Store an unparsed HTML-only receipt (no PDF)."""
+    """Store an unparsed HTML-only receipt (no PDF). Returns invoice_id."""
     inv_id = f"unparsed_{datetime.now().strftime('%Y%m%d%H%M%S')}"
     conn.execute("""
         INSERT INTO invoices
@@ -196,6 +236,7 @@ def _store_html_as_unparsed(conn, vendor_id, email_data, html_path, body_text):
     """, (inv_id, vendor_id, email_data["message_id"], html_path))
     conn.commit()
     log.info(f"Stored unparsed HTML invoice {inv_id} (body at {html_path})")
+    return inv_id
 
 
 def _notify_unknown_format(vendor_name, filename, email_data, error_msg=""):
@@ -321,7 +362,10 @@ def store_invoice(conn, vendor_id: int, parsed: ParsedInvoice, pdf_path: str,
 
 
 def store_unparsed_invoice(conn, vendor_id: int, email_data: dict, pdf_path: str):
-    """Store an invoice we couldn't parse (non-Intermedia vendor, etc.)."""
+    """Store an invoice we couldn't parse (non-Intermedia vendor, etc.).
+
+    Returns the invoice_id that was created.
+    """
     inv_id = f"unparsed_{datetime.now().strftime('%Y%m%d%H%M%S')}"
     conn.execute("""
         INSERT INTO invoices
@@ -330,3 +374,4 @@ def store_unparsed_invoice(conn, vendor_id: int, email_data: dict, pdf_path: str
     """, (inv_id, vendor_id, email_data["message_id"], pdf_path))
     conn.commit()
     log.info(f"Stored unparsed invoice {inv_id} (PDF at {pdf_path})")
+    return inv_id

@@ -20,7 +20,11 @@ from auth import (
     get_password_hash, verify_password, validate_password_strength,
     create_access_token, create_refresh_token,
     decode_access_token, decode_refresh_token,
-    extract_token_from_request, require_auth,
+    extract_token_from_request, require_auth, require_admin,
+)
+from format_recognition import (
+    get_review_list, get_review_by_id, extract_raw_text_from_document,
+    create_review,
 )
 
 logging.basicConfig(
@@ -962,6 +966,202 @@ def archive_old_invoices():
     conn.commit()
     conn.close()
     return jsonify({"success": True, "archived": archived})
+
+
+# ---------------------------------------------------------------------------
+# Format review queue API
+# ---------------------------------------------------------------------------
+
+@app.route("/api/reviews")
+@require_auth
+def list_reviews():
+    """GET /api/reviews?status=pending — list reviews with invoice + vendor info."""
+    status_filter = request.args.get("status")
+    conn = get_db()
+    reviews = get_review_list(conn, status_filter)
+    conn.close()
+    return jsonify(reviews)
+
+
+@app.route("/api/reviews/<int:review_id>")
+@require_auth
+def get_review(review_id):
+    """GET /api/reviews/<id> — full detail including raw text extraction."""
+    conn = get_db()
+    review = get_review_by_id(conn, review_id)
+    conn.close()
+    if not review:
+        abort(404)
+
+    # Type narrowing for the checker
+    detail: dict = review  # type: ignore[assignment]
+
+    # Extract raw text from the stored document
+    raw_text = ""
+    if detail.get("pdf_path"):
+        raw_text = extract_raw_text_from_document(detail["pdf_path"])
+
+    return jsonify({
+        "review": detail,
+        "raw_text": raw_text,
+    })
+
+
+@app.route("/api/reviews/<int:review_id>", methods=["PATCH"])
+@require_admin
+def patch_review(review_id):
+    """PATCH /api/reviews/<id> — update status/notes (admin only)."""
+    data = request.get_json() or {}
+    conn = get_db()
+
+    existing = conn.execute(
+        "SELECT id FROM format_reviews WHERE id = ?", (review_id,)
+    ).fetchone()
+    if not existing:
+        conn.close()
+        abort(404)
+
+    sets = []
+    values = []
+    for field in ("status", "notes"):
+        if field in data:
+            sets.append(f"{field} = ?")
+            values.append(data[field])
+
+    if sets:
+        values.append(review_id)
+        conn.execute(
+            f"UPDATE format_reviews SET {', '.join(sets)} WHERE id = ?",
+            values
+        )
+        conn.commit()
+
+    conn.close()
+    return jsonify({"success": True})
+
+
+@app.route("/api/reviews/<int:review_id>/extract", methods=["POST"])
+@require_admin
+def extract_and_verify(review_id):
+    """POST /api/reviews/<id>/extract — apply corrected field values to the
+    linked invoice, audit-log it, and set review status=verified (admin only).
+
+    Body: {field_overrides: {invoice_id, invoice_date, billing_period,
+          new_charges, outstanding_balance, ...}}
+    """
+    data = request.get_json() or {}
+    field_overrides = data.get("field_overrides", {})
+
+    conn = get_db()
+
+    review = conn.execute(
+        "SELECT * FROM format_reviews WHERE id = ?", (review_id,)
+    ).fetchone()
+    if not review:
+        conn.close()
+        abort(404)
+
+    invoice_id = review["invoice_id"]
+
+    # Update the linked invoice with corrected values
+    allowed_fields = {
+        "invoice_id", "invoice_date", "billing_period",
+        "is_credit_memo", "references_invoice",
+        "partner_name", "partner_id", "partner_username",
+        "previous_balance", "credit_card_surcharges",
+        "payment_received", "new_charges", "outstanding_balance",
+    }
+    invoice_sets = []
+    invoice_values = []
+    changes = {}
+    for field in allowed_fields:
+        if field in field_overrides:
+            val = field_overrides[field]
+            if field == "is_credit_memo":
+                val = 1 if val else 0
+            if field == "invoice_id" and val != invoice_id:
+                # Changing the invoice PK — FK constraints prevent a simple
+                # UPDATE on the PK.  Instead: create the new row, repoint
+                # children, then delete the old row.
+                new_invoice_id = str(val)
+                # Copy the existing invoice row to the new id
+                conn.execute(
+                    "INSERT OR IGNORE INTO invoices "
+                    "(id, vendor_id, billing_period, invoice_date, is_credit_memo, "
+                    " references_invoice, partner_name, partner_id, partner_username, "
+                    " previous_balance, credit_card_surcharges, payment_received, "
+                    " new_charges, outstanding_balance, source, email_message_id, pdf_path) "
+                    "SELECT ?, vendor_id, billing_period, invoice_date, is_credit_memo, "
+                    " references_invoice, partner_name, partner_id, partner_username, "
+                    " previous_balance, credit_card_surcharges, payment_received, "
+                    " new_charges, outstanding_balance, source, email_message_id, pdf_path "
+                    "FROM invoices WHERE id = ?",
+                    (new_invoice_id, invoice_id)
+                )
+                # Repoint child tables
+                conn.execute(
+                    "UPDATE customers SET invoice_id = ? WHERE invoice_id = ?",
+                    (new_invoice_id, invoice_id)
+                )
+                conn.execute(
+                    "UPDATE line_items SET invoice_id = ? WHERE invoice_id = ?",
+                    (new_invoice_id, invoice_id)
+                )
+                # Repoint the review itself
+                conn.execute(
+                    "UPDATE format_reviews SET invoice_id = ? WHERE id = ?",
+                    (new_invoice_id, review_id)
+                )
+                # Delete the old invoice row
+                conn.execute(
+                    "DELETE FROM invoices WHERE id = ?", (invoice_id,)
+                )
+                invoice_id = new_invoice_id
+                changes[field] = new_invoice_id
+                continue
+            invoice_sets.append(f"{field} = ?")
+            invoice_values.append(val)
+            changes[field] = val
+
+    if invoice_sets:
+        invoice_values.append(invoice_id)
+        conn.execute(
+            f"UPDATE invoices SET {', '.join(invoice_sets)} WHERE id = ?",
+            invoice_values
+        )
+
+    # Audit log
+    from db import log_audit
+    user_email = getattr(g, 'current_user_email', '') or ''
+    log_audit(conn, invoice_id, g.current_user_id, user_email,
+              "review_extract", changes)
+
+    # Set review to verified
+    conn.execute(
+        "UPDATE format_reviews SET status = 'verified', "
+        "reviewed_by = ?, reviewed_at = datetime('now') "
+        "WHERE id = ?",
+        (g.current_user_id, review_id)
+    )
+    conn.commit()
+    conn.close()
+
+    return jsonify({"success": True, "invoice_id": invoice_id})
+
+
+@app.route("/api/formats")
+@require_auth
+def list_formats():
+    """GET /api/formats — list registered formats per vendor."""
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT f.*, v.name as vendor_name "
+        "FROM invoice_formats f "
+        "JOIN vendors v ON f.vendor_id = v.id "
+        "ORDER BY v.name, f.last_seen DESC"
+    ).fetchall()
+    conn.close()
+    return jsonify([dict(r) for r in rows])
 
 
 if __name__ == "__main__":

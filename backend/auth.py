@@ -186,3 +186,42 @@ def require_auth(f):
         return f(*args, **kwargs)
 
     return decorated
+
+
+def require_admin(f):
+    """Decorator that requires a valid JWT access token AND admin role.
+
+    On success, sets g.current_user_id and g.current_user_email.
+    On failure, returns 401/403 with JSON error.
+    """
+    @functools.wraps(f)
+    def decorated(*args, **kwargs):
+        token = extract_token_from_request()
+        if not token:
+            return jsonify({"error": "Missing authentication token"}), 401
+
+        payload = decode_access_token(token)
+        if payload is None:
+            return jsonify({"error": "Invalid or expired token"}), 401
+
+        try:
+            user_id = int(payload["sub"])
+        except (KeyError, ValueError):
+            return jsonify({"error": "Invalid token payload"}), 401
+
+        g.current_user_id = user_id
+        g.current_user_email = payload.get("email", "")
+
+        # Check admin status
+        from db import get_db
+        conn = get_db()
+        user = conn.execute(
+            "SELECT is_admin FROM users WHERE id = ?", (user_id,)
+        ).fetchone()
+        conn.close()
+        if not user or not user["is_admin"]:
+            return jsonify({"error": "Admin access required"}), 403
+
+        return f(*args, **kwargs)
+
+    return decorated

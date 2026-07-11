@@ -105,6 +105,32 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
     version INTEGER PRIMARY KEY,
     applied_at TEXT DEFAULT (datetime('now'))
 );
+
+CREATE TABLE IF NOT EXISTS invoice_formats (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    vendor_id INTEGER NOT NULL REFERENCES vendors(id),
+    format_fingerprint TEXT NOT NULL,
+    parser_name TEXT NOT NULL DEFAULT '',
+    first_seen TEXT DEFAULT (datetime('now')),
+    last_seen TEXT DEFAULT (datetime('now')),
+    sample_count INTEGER DEFAULT 1,
+    status TEXT DEFAULT 'recognized'
+        CHECK(status IN ('recognized', 'new', 'deprecated'))
+);
+
+CREATE TABLE IF NOT EXISTS format_reviews (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    invoice_id TEXT NOT NULL REFERENCES invoices(id),
+    vendor_id INTEGER NOT NULL REFERENCES vendors(id),
+    detected_at TEXT DEFAULT (datetime('now')),
+    status TEXT DEFAULT 'pending'
+        CHECK(status IN ('pending', 'in_review', 'parsed', 'verified', 'dismissed')),
+    notes TEXT,
+    extracted_data TEXT,
+    detection_reason TEXT,
+    reviewed_by INTEGER REFERENCES users(id),
+    reviewed_at TEXT
+);
 """
 
 
@@ -120,6 +146,32 @@ MIGRATIONS = [
     # v2: add filename column to processed_emails for multi-attachment logging (#17)
     #     The column already exists in the original schema, so this is a no-op
     #     for new DBs. For existing DBs it was already there too.
+
+    # v3: create invoice_formats table for format fingerprint registry
+    "CREATE TABLE IF NOT EXISTS invoice_formats ("
+    "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+    "vendor_id INTEGER NOT NULL REFERENCES vendors(id), "
+    "format_fingerprint TEXT NOT NULL, "
+    "parser_name TEXT NOT NULL DEFAULT '', "
+    "first_seen TEXT DEFAULT (datetime('now')), "
+    "last_seen TEXT DEFAULT (datetime('now')), "
+    "sample_count INTEGER DEFAULT 1, "
+    "status TEXT DEFAULT 'recognized' "
+    "CHECK(status IN ('recognized', 'new', 'deprecated')))",
+
+    # v4: create format_reviews table for review queue
+    "CREATE TABLE IF NOT EXISTS format_reviews ("
+    "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+    "invoice_id TEXT NOT NULL REFERENCES invoices(id), "
+    "vendor_id INTEGER NOT NULL REFERENCES vendors(id), "
+    "detected_at TEXT DEFAULT (datetime('now')), "
+    "status TEXT DEFAULT 'pending' "
+    "CHECK(status IN ('pending', 'in_review', 'parsed', 'verified', 'dismissed')), "
+    "notes TEXT, "
+    "extracted_data TEXT, "
+    "detection_reason TEXT, "
+    "reviewed_by INTEGER REFERENCES users(id), "
+    "reviewed_at TEXT)",
 ]
 
 

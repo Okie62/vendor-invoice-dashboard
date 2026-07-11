@@ -158,3 +158,306 @@ class TestCSVExport:
         resp = client.get("/api/export/line-items", headers=auth_headers)
         assert resp.status_code == 200
         assert b"Item" in resp.data
+
+
+# ---------------------------------------------------------------------------
+# Format Recognition Tests
+# ---------------------------------------------------------------------------
+
+
+class TestComputeFingerprint:
+    def test_intermedia_fingerprint(self):
+        from format_recognition import compute_fingerprint
+        text = "Invoice #1234567 Billing Period: Jun 01, 2026 - Jun 30, 2026"
+        fp = compute_fingerprint(text)
+        assert "billing period" in fp
+        assert "invoice" in fp
+
+    def test_barracuda_fingerprint(self):
+        from format_recognition import compute_fingerprint
+        text = "Invoice #INV26514789 Subtotal $6,560.00 Amount Due $6,560.00"
+        fp = compute_fingerprint(text)
+        assert "subtotal" in fp
+        assert "amount due" in fp
+        assert "invoice" in fp
+
+    def test_flyover_fingerprint(self):
+        from format_recognition import compute_fingerprint
+        text = "Invoice no.: 250541 Invoice date: 05/31/2026 Balance due $0.00"
+        fp = compute_fingerprint(text)
+        assert "invoice no" in fp
+        assert "balance due" in fp
+
+    def test_extraspace_fingerprint(self):
+        from format_recognition import compute_fingerprint
+        text = "Transaction Number: 381091629 Payment Date: 07/09/2026 Payment Total: $186.20"
+        fp = compute_fingerprint(text)
+        assert "transaction number" in fp
+        assert "payment date" in fp
+        assert "payment total" in fp
+
+    def test_empty_text_fingerprint(self):
+        from format_recognition import compute_fingerprint
+        assert compute_fingerprint("") == "__empty__"
+
+    def test_no_match_fingerprint(self):
+        from format_recognition import compute_fingerprint
+        fp = compute_fingerprint("quux barzop glorf snizzleflomp wibble")
+        assert fp == "__unknown__"
+
+    def test_deterministic_sorting(self):
+        from format_recognition import compute_fingerprint
+        fp1 = compute_fingerprint("Invoice total balance due new charges")
+        fp2 = compute_fingerprint("total new charges balance due invoice")
+        assert fp1 == fp2
+
+
+class TestFormatRegistration:
+    def test_register_new_format(self, client, auth_headers):
+        from db import get_db
+        from format_recognition import compute_fingerprint, register_format
+
+        # First create a vendor via the API
+        resp = client.post("/api/upload", headers=auth_headers, data={
+            "vendor": "TestVendor",
+        })
+        # upload needs a file, so let's just add a vendor directly
+        conn = get_db()
+        cursor = conn.execute(
+            "INSERT INTO vendors (name, email_domain) VALUES (?, ?)",
+            ("TestVendor", "testvendor.com")
+        )
+        vendor_id = cursor.lastrowid
+        conn.commit()
+
+        fp = compute_fingerprint("Invoice #123 Billing Period Jan")
+        reg = register_format(conn, vendor_id, fp, "pdf_parser")
+        assert reg["is_new"] is True
+        assert reg["status"] == "new"
+
+        # Second register should not be new
+        reg2 = register_format(conn, vendor_id, fp, "pdf_parser")
+        assert reg2["is_new"] is False
+        conn.close()
+
+    def test_register_format_twice_not_new(self, client, auth_headers):
+        from db import get_db
+        from format_recognition import compute_fingerprint, register_format, is_recognized_format
+
+        conn = get_db()
+        cursor = conn.execute(
+            "INSERT INTO vendors (name, email_domain) VALUES (?, ?)",
+            ("FormatVendor", "fmt.com")
+        )
+        vendor_id = cursor.lastrowid
+        fp = compute_fingerprint("Total new charges payment received")
+        register_format(conn, vendor_id, fp, "pdf_parser")
+
+        # After one registration, it's still 'new', not 'recognized'
+        assert is_recognized_format(conn, vendor_id, fp) is False
+
+        # Change status to 'recognized' manually
+        conn.execute(
+            "UPDATE invoice_formats SET status = 'recognized' WHERE vendor_id = ?",
+            (vendor_id,)
+        )
+        conn.commit()
+        assert is_recognized_format(conn, vendor_id, fp) is True
+        conn.close()
+
+
+class TestReviewQueueAPI:
+    def test_list_reviews_empty(self, client, auth_headers):
+        resp = client.get("/api/reviews", headers=auth_headers)
+        assert resp.status_code == 200
+        assert resp.get_json() == []
+
+    def test_list_reviews_filter_by_status(self, client, auth_headers):
+        resp = client.get("/api/reviews?status=pending", headers=auth_headers)
+        assert resp.status_code == 200
+        assert resp.get_json() == []
+
+    def test_get_review_not_found(self, client, auth_headers):
+        resp = client.get("/api/reviews/9999", headers=auth_headers)
+        assert resp.status_code == 404
+
+    def test_patch_review_requires_admin(self, client, auth_token):
+        headers = {"Authorization": f"Bearer {auth_token}"}
+        # First user is admin, so register a non-admin user
+        resp = client.post("/api/auth/register", json={
+            "email": "nonadmin@test.com",
+            "password": "TestPass456!",
+            "full_name": "NonAdmin"
+        })
+        token = resp.get_json()["access_token"]
+        nonadmin_headers = {"Authorization": f"Bearer {token}"}
+
+        resp = client.patch("/api/reviews/1", json={"status": "in_review"},
+                            headers=nonadmin_headers)
+        assert resp.status_code == 403
+        assert "Admin access required" in resp.get_json()["error"]
+
+    def test_create_review_and_list(self, client, auth_headers):
+        from db import get_db
+        from format_recognition import create_review
+
+        conn = get_db()
+        cursor = conn.execute(
+            "INSERT INTO vendors (name, email_domain) VALUES (?, ?)",
+            ("ReviewVendor", "rv.com")
+        )
+        vendor_id = cursor.lastrowid
+
+        # Create an invoice first
+        inv_id = "test_inv_001"
+        conn.execute(
+            "INSERT INTO invoices (id, vendor_id, source, new_charges, outstanding_balance) "
+            "VALUES (?, ?, 'email_unparsed', 0, 0)",
+            (inv_id, vendor_id)
+        )
+        conn.commit()
+
+        # Create a review
+        rid = create_review(conn, inv_id, vendor_id, "no_parser",
+                            extracted_data={"vendor": "ReviewVendor"})
+        conn.close()
+
+        resp = client.get("/api/reviews?status=pending", headers=auth_headers)
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert len(data) >= 1
+        review = data[0]
+        assert review["invoice_id"] == inv_id
+        assert review["detection_reason"] == "no_parser"
+        assert review["vendor_name"] == "ReviewVendor"
+        assert review["extracted_data"]["vendor"] == "ReviewVendor"
+
+    def test_extract_and_verify(self, client, auth_headers):
+        from db import get_db
+        from format_recognition import create_review
+
+        conn = get_db()
+        cursor = conn.execute(
+            "INSERT INTO vendors (name, email_domain) VALUES (?, ?)",
+            ("ExtractVendor", "ext.com")
+        )
+        vendor_id = cursor.lastrowid
+
+        inv_id = "test_inv_extract"
+        conn.execute(
+            "INSERT INTO invoices (id, vendor_id, source, new_charges, outstanding_balance) "
+            "VALUES (?, ?, 'email_unparsed', 0, 0)",
+            (inv_id, vendor_id)
+        )
+        conn.commit()
+
+        rid = create_review(conn, inv_id, vendor_id, "no_parser")
+        conn.close()
+
+        # Extract/verify
+        resp = client.post(
+            f"/api/reviews/{rid}/extract",
+            headers=auth_headers,
+            json={
+                "field_overrides": {
+                    "new_charges": 1500.00,
+                    "outstanding_balance": 1500.00,
+                    "billing_period": "Jun 2026",
+                }
+            }
+        )
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["success"] is True
+
+        # Verify the invoice was updated
+        conn = get_db()
+        inv = conn.execute(
+            "SELECT * FROM invoices WHERE id = ?", (inv_id,)
+        ).fetchone()
+        assert inv["new_charges"] == 1500.00
+        assert inv["outstanding_balance"] == 1500.00
+        assert inv["billing_period"] == "Jun 2026"
+
+        # Verify the review is now verified
+        review = conn.execute(
+            "SELECT status FROM format_reviews WHERE id = ?", (rid,)
+        ).fetchone()
+        assert review["status"] == "verified"
+
+        # Verify audit log was created
+        audit = conn.execute(
+            "SELECT * FROM audit_log WHERE invoice_id = ?", (inv_id,)
+        ).fetchall()
+        assert len(audit) >= 1
+        assert audit[0]["action"] == "review_extract"
+        conn.close()
+
+    def test_extract_verify_changes_invoice_id(self, client, auth_headers):
+        from db import get_db
+        from format_recognition import create_review
+
+        conn = get_db()
+        cursor = conn.execute(
+            "INSERT INTO vendors (name, email_domain) VALUES (?, ?)",
+            ("RenameVendor", "ren.com")
+        )
+        vendor_id = cursor.lastrowid
+
+        inv_id = "old_inv_id"
+        conn.execute(
+            "INSERT INTO invoices (id, vendor_id, source, new_charges, outstanding_balance) "
+            "VALUES (?, ?, 'email_unparsed', 0, 0)",
+            (inv_id, vendor_id)
+        )
+        conn.commit()
+
+        rid = create_review(conn, inv_id, vendor_id, "no_parser")
+        conn.close()
+
+        resp = client.post(
+            f"/api/reviews/{rid}/extract",
+            headers=auth_headers,
+            json={
+                "field_overrides": {
+                    "invoice_id": "corrected_inv_002",
+                    "new_charges": 500.00,
+                }
+            }
+        )
+        assert resp.status_code == 200
+
+        # Verify old invoice id is gone, new exists
+        conn = get_db()
+        old = conn.execute(
+            "SELECT 1 FROM invoices WHERE id = ?", ("old_inv_id",)
+        ).fetchone()
+        assert old is None
+        new = conn.execute(
+            "SELECT 1 FROM invoices WHERE id = ?", ("corrected_inv_002",)
+        ).fetchone()
+        assert new is not None
+        conn.close()
+
+    def test_list_formats(self, client, auth_headers):
+        from db import get_db
+        from format_recognition import compute_fingerprint, register_format
+
+        conn = get_db()
+        cursor = conn.execute(
+            "INSERT INTO vendors (name, email_domain) VALUES (?, ?)",
+            ("FormatListVendor", "flv.com")
+        )
+        vendor_id = cursor.lastrowid
+
+        fp = compute_fingerprint("Invoice #X Billing Period Y Total $100")
+        register_format(conn, vendor_id, fp, "pdf_parser")
+        conn.close()
+
+        resp = client.get("/api/formats", headers=auth_headers)
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert len(data) >= 1
+        fmt = next(f for f in data if f["vendor_name"] == "FormatListVendor")
+        assert fmt["format_fingerprint"] == fp
+        assert fmt["status"] == "new"
