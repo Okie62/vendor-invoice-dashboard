@@ -23,6 +23,38 @@ export interface Vendor {
   email_domain: string;
 }
 
+export interface VendorDetail {
+  vendor: Vendor;
+  totals: {
+    invoice_count: number;
+    total_new_charges: number;
+    total_outstanding: number;
+    total_paid: number;
+  };
+  aging: {
+    no_due_date: number;
+    current: number;
+    days_1_30: number;
+    days_31_60: number;
+    days_61_90: number;
+    days_90_plus: number;
+  };
+  invoices: DBInvoice[];
+  formats: FormatRecord[];
+}
+
+export interface FormatRecord {
+  id: number;
+  vendor_id: number;
+  vendor_name: string;
+  format_fingerprint: string;
+  parser_name: string;
+  first_seen: string;
+  last_seen: string;
+  sample_count: number;
+  status: string;
+}
+
 export interface InvoiceSummary {
   previous_balance: number;
   credit_card_surcharges: number;
@@ -52,16 +84,42 @@ export interface LineItem {
   amount: number;
 }
 
-export interface Invoice {
+export interface DBInvoice {
   id: string;
-  vendor: string;
+  vendor_id?: number;
+  vendor_name?: string;
   billing_period: string;
   invoice_date?: string;
+  due_date?: string;
   is_credit_memo: boolean;
   references_invoice: string | null;
   partner_name: string;
   partner_id: string;
   partner_username: string;
+  previous_balance?: number;
+  new_charges?: number;
+  outstanding_balance?: number;
+  payment_received?: number;
+  status: string;
+  source: string;
+  pdf_path?: string;
+  created_at?: string;
+}
+
+export interface Invoice {
+  id: string;
+  vendor: string;
+  vendor_id?: number;
+  billing_period: string;
+  invoice_date?: string;
+  due_date?: string;
+  is_credit_memo: boolean;
+  references_invoice: string | null;
+  partner_name: string;
+  partner_id: string;
+  partner_username: string;
+  status: string;
+  source?: string;
   summary: InvoiceSummary;
   customers: Customer[];
   line_items: LineItem[];
@@ -87,6 +145,11 @@ export interface InvoiceFilters {
   start?: string;
   end?: string;
   search?: string;
+  status?: string;
+  due_from?: string;
+  due_to?: string;
+  sort_field?: string;
+  sort_dir?: string;
 }
 
 export interface UserCreateRequest {
@@ -115,13 +178,44 @@ export interface ReviewItem {
   created_at: string;
 }
 
-export interface FormatDef {
-  id: string;
-  vendor: string;
-  name: string;
-  version: string;
-  fields: string[];
+export interface DashboardData {
+  summary: {
+    total_outstanding: number;
+    due_soon: number;
+    overdue: number;
+    paid_this_month: number;
+  };
+  aging: {
+    no_due_date: number;
+    current: number;
+    days_1_30: number;
+    days_31_60: number;
+    days_61_90: number;
+    days_90_plus: number;
+  };
+  recent_invoices: DBInvoice[];
+  monthly_spend: {
+    month: string;
+    total_charges: number;
+    total_outstanding: number;
+  }[];
+  status_counts: {
+    status: string;
+    count: number;
+  }[];
 }
+
+export type InvoiceStatus = 'received' | 'needs_review' | 'approved' | 'scheduled' | 'paid';
+
+export const VALID_STATUSES: InvoiceStatus[] = ['received', 'needs_review', 'approved', 'scheduled', 'paid'];
+
+export const STATUS_STYLES: Record<string, { bg: string; text: string; border: string }> = {
+  received: { bg: 'rgba(148,163,184,0.12)', text: '#94a3b8', border: 'rgba(148,163,184,0.25)' },
+  needs_review: { bg: 'rgba(245,158,11,0.12)', text: '#f59e0b', border: 'rgba(245,158,11,0.25)' },
+  approved: { bg: 'rgba(57,216,189,0.12)', text: '#39d8bd', border: 'rgba(57,216,189,0.25)' },
+  scheduled: { bg: 'rgba(99,102,241,0.12)', text: '#6366f1', border: 'rgba(99,102,241,0.25)' },
+  paid: { bg: 'rgba(39,166,68,0.12)', text: '#27a644', border: 'rgba(39,166,68,0.25)' },
+};
 
 // ── Axios instance ──
 const api = axios.create({ baseURL: '' });
@@ -201,20 +295,44 @@ export async function checkSetup(): Promise<{ has_users: boolean }> {
   return data;
 }
 
+// ── Dashboard ──
+export async function getDashboard(): Promise<DashboardData> {
+  const { data } = await api.get<DashboardData>('/api/dashboard');
+  return data;
+}
+
 // ── Vendors ──
 export async function getVendors(): Promise<Vendor[]> {
   const { data } = await api.get<Vendor[]>('/api/vendors');
   return data;
 }
 
+export async function getVendorDetail(id: number): Promise<VendorDetail> {
+  const { data } = await api.get<VendorDetail>(`/api/vendors/${id}`);
+  return data;
+}
+
 // ── Invoices ──
-export async function getInvoices(filters: InvoiceFilters = {}): Promise<Invoice[]> {
+function stripEmpty(params: Record<string, string>): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(params)) {
+    if (v !== '' && v !== undefined && v !== null) out[k] = v;
+  }
+  return out;
+}
+
+export async function getInvoices(filters: InvoiceFilters = {}): Promise<DBInvoice[]> {
   const params: Record<string, string> = {};
   if (filters.vendor) params.vendor = filters.vendor;
   if (filters.start) params.start = filters.start;
   if (filters.end) params.end = filters.end;
   if (filters.search) params.search = filters.search;
-  const { data } = await api.get<Invoice[]>('/api/invoices', { params });
+  if (filters.status) params.status = filters.status;
+  if (filters.due_from) params.due_from = filters.due_from;
+  if (filters.due_to) params.due_to = filters.due_to;
+  if (filters.sort_field) params.sort_field = filters.sort_field;
+  if (filters.sort_dir) params.sort_dir = filters.sort_dir;
+  const { data } = await api.get<DBInvoice[]>('/api/invoices', { params: stripEmpty(params) });
   return data;
 }
 
@@ -224,7 +342,7 @@ export async function getInvoicesBulk(filters: InvoiceFilters = {}): Promise<Inv
   if (filters.start) params.start = filters.start;
   if (filters.end) params.end = filters.end;
   if (filters.search) params.search = filters.search;
-  const { data } = await api.get<InvoiceBulkResponse>('/api/invoices/bulk', { params });
+  const { data } = await api.get<InvoiceBulkResponse>('/api/invoices/bulk', { params: stripEmpty(params) });
   return data;
 }
 
@@ -248,13 +366,27 @@ export async function getInvoiceRawText(id: string): Promise<{ text: string }> {
   return data;
 }
 
+export async function updateInvoiceStatus(id: string, status: string, dueDate?: string): Promise<{ success: boolean; changes: Record<string, unknown> }> {
+  const body: Record<string, string> = { status };
+  if (dueDate) body.due_date = dueDate;
+  const { data } = await api.patch<{ success: boolean; changes: Record<string, unknown> }>(`/api/invoices/${id}/status`, body);
+  return data;
+}
+
+export async function bulkUpdateStatus(ids: string[], status: string, dueDate?: string): Promise<{ success: boolean; updated: number }> {
+  const body: Record<string, unknown> = { ids, status };
+  if (dueDate) body.due_date = dueDate;
+  const { data } = await api.patch<{ success: boolean; updated: number }>('/api/invoices/bulk-status', body);
+  return data;
+}
+
 // ── Summary ──
 export async function getSummary(filters: InvoiceFilters = {}): Promise<DBSummary> {
   const params: Record<string, string> = {};
   if (filters.vendor) params.vendor = filters.vendor;
   if (filters.start) params.start = filters.start;
   if (filters.end) params.end = filters.end;
-  const { data } = await api.get<DBSummary>('/api/summary', { params });
+  const { data } = await api.get<DBSummary>('/api/summary', { params: stripEmpty(params) });
   return data;
 }
 
@@ -300,7 +432,7 @@ export async function deactivateUser(userId: number): Promise<{ success: boolean
   return data;
 }
 
-// ── Format Review (stub endpoints — may 404 until backend is ready) ──
+// ── Format Review ──
 export async function getReviews(status = 'pending'): Promise<ReviewItem[]> {
   const { data } = await api.get<ReviewItem[]>('/api/reviews', { params: { status } });
   return data;
@@ -321,7 +453,7 @@ export async function extractReview(id: string, field_overrides: Record<string, 
   return data;
 }
 
-export async function getFormats(): Promise<FormatDef[]> {
-  const { data } = await api.get<FormatDef[]>('/api/formats');
+export async function getFormats(): Promise<FormatRecord[]> {
+  const { data } = await api.get<FormatRecord[]>('/api/formats');
   return data;
 }

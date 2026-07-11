@@ -7,6 +7,7 @@ import Login from './pages/Login';
 import Dashboard from './pages/Dashboard';
 import Invoices from './pages/Invoices';
 import Vendors from './pages/Vendors';
+import VendorDetail from './pages/VendorDetail';
 import Users from './pages/admin/Users';
 import Reviews from './pages/admin/Reviews';
 
@@ -31,6 +32,7 @@ function App() {
                 <Route index element={<Dashboard />} />
                 <Route path="invoices" element={<Invoices />} />
                 <Route path="vendors" element={<Vendors />} />
+                <Route path="vendors/:id" element={<VendorDetail />} />
                 <Route path="admin/users" element={<Users />} />
                 <Route path="admin/reviews" element={<Reviews />} />
               </Route>

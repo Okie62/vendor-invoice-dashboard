@@ -25,8 +25,8 @@ const mainNav = [
 ];
 
 const adminNav = [
-  { name: 'Users', href: '/admin/users', icon: ShieldCheck },
   { name: 'Format Review', href: '/admin/reviews', icon: ClipboardList },
+  { name: 'Users', href: '/admin/users', icon: ShieldCheck },
 ];
 
 interface SidebarProps {
@@ -41,7 +41,6 @@ export default function Sidebar({ mobileOpen = false, onMobileClose }: SidebarPr
 
   const navItems = [
     ...mainNav,
-    ...(user?.is_admin ? adminNav : []),
   ];
 
   return (
@@ -75,6 +74,34 @@ export default function Sidebar({ mobileOpen = false, onMobileClose }: SidebarPr
       {/* Navigation */}
       <nav className="flex-1 space-y-0.5 px-2 py-3 overflow-y-auto">
         {navItems.map((item) => (
+          <NavLink
+            key={item.name}
+            to={item.href}
+            title={collapsed ? item.name : undefined}
+            onClick={onMobileClose}
+            className={({ isActive }) =>
+              `group flex items-center rounded-comfortable text-caption-lg font-medium transition-colors ${
+                collapsed ? 'justify-center px-2 py-3 md:py-2' : 'px-2.5 py-3 md:py-1.5'
+              }`
+            }
+            style={({ isActive }) => ({
+              backgroundColor: isActive ? 'var(--th-active)' : 'transparent',
+              color: isActive ? 'var(--th-text-primary)' : 'var(--th-text-tertiary)',
+            })}
+          >
+            <item.icon className={`h-4 w-4 flex-shrink-0 ${collapsed ? '' : 'mr-2.5'}`} strokeWidth={1.75} />
+            {!collapsed && <span className="flex-1">{item.name}</span>}
+          </NavLink>
+        ))}
+
+        {/* Admin section separator */}
+        {user?.is_admin && !collapsed && (
+          <div className="pt-4 pb-1">
+            <p className="px-2.5 text-[10px] font-semibold uppercase tracking-wider" style={{ color: 'var(--th-text-quaternary)' }}>Admin</p>
+          </div>
+        )}
+
+        {user?.is_admin && adminNav.map((item) => (
           <NavLink
             key={item.name}
             to={item.href}

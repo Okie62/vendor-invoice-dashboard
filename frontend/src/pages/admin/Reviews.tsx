@@ -2,7 +2,7 @@ import { useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { ClipboardList, AlertTriangle } from 'lucide-react';
 import { getReviews, getFormats } from '../../lib/api';
-import type { ReviewItem, FormatDef } from '../../lib/api';
+import type { ReviewItem, FormatRecord } from '../../lib/api';
 
 export default function Reviews() {
   const [status, setStatus] = useState('pending');
@@ -86,7 +86,7 @@ export default function Reviews() {
           <div className="flex flex-wrap gap-2">
             {formats.map((f) => (
               <span key={f.id} className="text-xs px-2 py-1 rounded-full" style={{ backgroundColor: 'var(--th-surface-2)', color: 'var(--th-text-secondary)', border: '1px solid var(--th-border)' }}>
-                {f.vendor}: {f.name} v{f.version}
+                {f.vendor_name}: {f.parser_name} ({f.sample_count} sample{f.sample_count !== 1 ? 's' : ''})
               </span>
             ))}
           </div>
