@@ -1,0 +1,209 @@
+@import "tailwindcss";
+@plugin "@tailwindcss/forms";
+
+@variant dark (&:where(.dark, .dark *));
+
+@theme {
+  --font-sans: 'Inter', 'SF Pro Display', -apple-system, system-ui, 'Segoe UI', Roboto, sans-serif;
+  --color-brand: #39d8bd;
+  --color-brand-hover: #2ec4a8;
+  --color-brand-accent: #56c4ef;
+  --color-brand-text: #04100f;
+  --color-cyan: #58c8f0;
+  --color-green: #8ee6a0;
+  --color-amber: #f2ba66;
+  --color-blue: #9eb9ff;
+  --radius-micro: 2px;
+  --radius-comfortable: 6px;
+  --radius-card: 8px;
+  --radius-panel: 12px;
+  --radius-large: 22px;
+  --text-micro: 11px;
+  --text-micro--line-height: 1.4;
+  --text-label: 12px;
+  --text-label--line-height: 1.4;
+  --text-caption: 13px;
+  --text-caption--line-height: 1.5;
+  --text-caption-lg: 14px;
+  --text-caption-lg--line-height: 1.5;
+  --text-body-sm: 15px;
+  --text-body-sm--line-height: 1.6;
+  --text-body: 16px;
+  --text-body--line-height: 1.5;
+  --text-body-lg: 18px;
+  --text-body-lg--line-height: 1.6;
+  --shadow-ring: rgba(0,0,0,0.2) 0px 0px 0px 1px;
+  --shadow-subtle: rgba(0,0,0,0.03) 0px 1.2px 0px 0px;
+  --shadow-elevated: rgba(0,0,0,0.4) 0px 2px 4px;
+  --shadow-dialog: rgba(0,0,0,0) 0px 8px 2px, rgba(0,0,0,0.01) 0px 5px 2px, rgba(0,0,0,0.04) 0px 3px 2px, rgba(0,0,0,0.07) 0px 1px 1px, rgba(0,0,0,0.08) 0px 0px 1px;
+}
+
+@theme inline {
+  --color-success: var(--th-success);
+  --color-success-soft: var(--th-success-bg);
+  --color-success-solid: var(--th-success-solid);
+  --color-warning: var(--th-warning);
+  --color-warning-soft: var(--th-warning-bg);
+  --color-warning-solid: var(--th-warning-solid);
+  --color-danger: var(--th-danger);
+  --color-danger-soft: var(--th-danger-bg);
+  --color-danger-solid: var(--th-danger-solid);
+  --color-info: var(--th-info);
+  --color-info-soft: var(--th-info-bg);
+  --color-info-solid: var(--th-info-solid);
+}
+
+:root,
+:root.light {
+  --th-bg: #f5f6f8;
+  --th-surface-0: #ffffff;
+  --th-surface-1: #f8f9fb;
+  --th-surface-2: #eef0f3;
+  --th-surface-3: #dfe2e7;
+  --th-text-primary: #060b15;
+  --th-text-secondary: #1e293b;
+  --th-text-tertiary: #334155;
+  --th-text-quaternary: #475569;
+  --th-border: rgba(0,0,0,0.08);
+  --th-border-strong: rgba(0,0,0,0.14);
+  --th-hover: rgba(0,0,0,0.04);
+  --th-active: rgba(0,0,0,0.07);
+  --th-input-bg: #ffffff;
+  --th-input-border: #d1d5db;
+  --th-card-shadow: 0 1px 3px rgba(0,0,0,0.06), 0 1px 2px rgba(0,0,0,0.04);
+  --th-scrollbar: rgba(0,0,0,0.15);
+  --th-scrollbar-hover: rgba(0,0,0,0.25);
+  --th-accent: #0b7c6b;
+  --th-accent-muted: #178a74;
+  --th-success: #15803d;
+  --th-success-bg: rgba(34,197,94,0.12);
+  --th-success-solid: #16a34a;
+  --th-warning: #b45309;
+  --th-warning-bg: rgba(245,158,11,0.14);
+  --th-warning-solid: #d97706;
+  --th-danger: #dc2626;
+  --th-danger-bg: rgba(239,68,68,0.10);
+  --th-danger-solid: #dc2626;
+  --th-info: #0e7490;
+  --th-info-bg: rgba(8,145,178,0.10);
+  --th-info-solid: #0891b2;
+}
+
+:root.dark {
+  --th-bg: #080c10;
+  --th-surface-0: #0d1318;
+  --th-surface-1: #101920;
+  --th-surface-2: #141d25;
+  --th-surface-3: #19232d;
+  --th-text-primary: #f4f8fb;
+  --th-text-secondary: #c5d2da;
+  --th-text-tertiary: #9cadb8;
+  --th-text-quaternary: #748590;
+  --th-border: rgba(57,216,189,0.12);
+  --th-border-strong: rgba(57,216,189,0.18);
+  --th-hover: rgba(57,216,189,0.06);
+  --th-active: rgba(57,216,189,0.10);
+  --th-input-bg: rgba(57,216,189,0.04);
+  --th-input-border: rgba(57,216,189,0.14);
+  --th-card-shadow: 0 20px 56px rgba(0,0,0,0.42), 0 0 0 1px rgba(57,216,189,0.07);
+  --th-scrollbar: rgba(57,216,189,0.14);
+  --th-scrollbar-hover: rgba(57,216,189,0.24);
+  --th-accent: #7ff2de;
+  --th-accent-muted: #39d8bd;
+  --th-success: #8ee6a0;
+  --th-success-bg: rgba(142,230,160,0.12);
+  --th-success-solid: #2f9e54;
+  --th-warning: #f2ba66;
+  --th-warning-bg: rgba(242,186,102,0.14);
+  --th-warning-solid: #c98a2e;
+  --th-danger: #ff8c8c;
+  --th-danger-bg: rgba(255,140,140,0.12);
+  --th-danger-solid: #d9534f;
+  --th-info: #58c8f0;
+  --th-info-bg: rgba(88,200,240,0.12);
+  --th-info-solid: #2f8fbf;
+}
+
+.app-canvas {
+  background-color: var(--th-surface-1);
+}
+
+:root.dark .app-canvas {
+  background-color: #080c10;
+  background-image:
+    linear-gradient(115deg, rgba(57, 216, 189, 0.07), transparent 30%),
+    linear-gradient(245deg, rgba(88, 200, 240, 0.05), transparent 32%),
+    linear-gradient(180deg, #0b1015 0%, #080c10 40%, #0a0f13 100%);
+  background-attachment: fixed;
+}
+
+*,
+*::before,
+*::after {
+  font-feature-settings: "cv01", "ss03";
+}
+
+body {
+  background-color: var(--th-bg);
+  color: var(--th-text-primary);
+  font-family: 'Inter', -apple-system, system-ui, sans-serif;
+  margin: 0;
+  min-height: 100vh;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  transition: background-color 0.2s ease, color 0.2s ease;
+}
+
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--th-scrollbar);
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--th-scrollbar-hover);
+}
+
+input:not([type]),
+input[type="text"],
+input[type="email"],
+input[type="password"],
+input[type="search"],
+input[type="number"],
+input[type="date"],
+textarea,
+select {
+  background-color: var(--th-input-bg);
+  border-color: var(--th-input-border);
+  color: var(--th-text-primary);
+  border-radius: 6px;
+  transition: background-color 0.2s ease, border-color 0.2s ease, color 0.2s ease;
+}
+
+input:focus,
+textarea:focus,
+select:focus {
+  border-color: var(--color-brand);
+  box-shadow: 0 0 0 1px var(--color-brand);
+}
+
+input::placeholder,
+textarea::placeholder {
+  color: var(--th-text-tertiary);
+}
+
+input[type="checkbox"] {
+  background-color: var(--th-input-bg);
+  border-color: var(--th-input-border);
+  border-radius: 4px;
+}
+
+input[type="checkbox"]:checked {
+  background-color: var(--color-brand);
+  border-color: var(--color-brand);
+}

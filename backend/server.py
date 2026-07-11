@@ -32,7 +32,10 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s"
 )
 
-app = Flask(__name__, static_folder="../frontend", static_url_path="")
+app = Flask(__name__, static_folder="../frontend", static_url_path="/legacy-static")
+
+# React build output for the new dashboard
+REACT_DIST = Path(__file__).resolve().parent.parent / "frontend" / "dist"
 
 
 # ---------------------------------------------------------------------------
@@ -72,6 +75,9 @@ init_db()
 
 @app.route("/")
 def index():
+    """Serve the React SPA if built, otherwise fall back to old HTML dashboard."""
+    if REACT_DIST.exists() and (REACT_DIST / "index.html").exists():
+        return send_from_directory(str(REACT_DIST), "index.html")
     return send_from_directory(app.static_folder, "index.html")
 
 
@@ -966,6 +972,140 @@ def archive_old_invoices():
     conn.commit()
     conn.close()
     return jsonify({"success": True, "archived": archived})
+
+
+# ---------------------------------------------------------------------------
+# Admin user management
+# ---------------------------------------------------------------------------
+
+
+def _admin_check():
+    """Check that the current user is an admin. Returns True if admin."""
+    conn = get_db()
+    user = conn.execute(
+        "SELECT is_admin FROM users WHERE id = ? AND is_active = 1",
+        (g.current_user_id,)
+    ).fetchone()
+    conn.close()
+    return bool(user and user["is_admin"])
+
+
+@app.route("/api/admin/users")
+@require_auth
+def admin_list_users():
+    """List all users (admin only)."""
+    if not _admin_check():
+        return jsonify({"error": "Admin access required"}), 403
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT id, email, full_name, is_active, is_admin, created_at "
+        "FROM users ORDER BY created_at DESC"
+    ).fetchall()
+    conn.close()
+    return jsonify([dict(r) for r in rows])
+
+
+@app.route("/api/admin/users", methods=["POST"])
+@require_auth
+def admin_create_user():
+    """Create a new user (admin only)."""
+    if not _admin_check():
+        return jsonify({"error": "Admin access required"}), 403
+    data = request.get_json() or {}
+    email = data.get("email", "").strip().lower()
+    password = data.get("password", "")
+    full_name = data.get("full_name", "")
+
+    if not email or not password or not full_name:
+        return jsonify({"error": "Email, password, and full name required"}), 400
+
+    err = validate_password_strength(password)
+    if err:
+        return jsonify({"error": err}), 400
+
+    conn = get_db()
+    existing = conn.execute(
+        "SELECT 1 FROM users WHERE email = ?", (email,)
+    ).fetchone()
+    if existing:
+        conn.close()
+        return jsonify({"error": "Email already registered"}), 400
+
+    cursor = conn.execute(
+        "INSERT INTO users (email, hashed_password, full_name, is_admin) "
+        "VALUES (?, ?, ?, 0)",
+        (email, get_password_hash(password), full_name)
+    )
+    conn.commit()
+    user_id = cursor.lastrowid
+    conn.close()
+
+    return jsonify({
+        "id": user_id,
+        "email": email,
+        "full_name": full_name,
+        "is_active": True,
+        "is_admin": False,
+        "created_at": "",
+    }), 201
+
+
+@app.route("/api/admin/users/<int:user_id>/role", methods=["PATCH"])
+@require_auth
+def admin_toggle_role(user_id):
+    """Toggle a user's admin role (admin only)."""
+    if not _admin_check():
+        return jsonify({"error": "Admin access required"}), 403
+    data = request.get_json() or {}
+    is_admin = data.get("is_admin", False)
+
+    conn = get_db()
+    conn.execute(
+        "UPDATE users SET is_admin = ? WHERE id = ?",
+        (1 if is_admin else 0, user_id)
+    )
+    conn.commit()
+    conn.close()
+    return jsonify({"success": True})
+
+
+@app.route("/api/admin/users/<int:user_id>", methods=["DELETE"])
+@require_auth
+def admin_deactivate_user(user_id):
+    """Deactivate a user (admin only). Cannot deactivate yourself."""
+    if not _admin_check():
+        return jsonify({"error": "Admin access required"}), 403
+    if user_id == g.current_user_id:
+        return jsonify({"error": "Cannot deactivate yourself"}), 400
+
+    conn = get_db()
+    conn.execute(
+        "UPDATE users SET is_active = 0 WHERE id = ?",
+        (user_id,)
+    )
+    conn.commit()
+    conn.close()
+    return jsonify({"success": True})
+
+
+# ---------------------------------------------------------------------------
+# SPA catch-all (must be LAST route — after all API routes)
+# ---------------------------------------------------------------------------
+
+
+@app.route("/<path:path>")
+def spa_fallback(path):
+    """Serve React SPA for non-API routes."""
+    # Let Flask handle API routes — they're registered with higher priority
+    if path.startswith("api/"):
+        return send_from_directory(app.static_folder, path), 404
+    # Serve from React dist if available
+    if REACT_DIST.exists():
+        full_path = REACT_DIST / path
+        if full_path.exists() and full_path.is_file():
+            return send_from_directory(str(REACT_DIST), path)
+        return send_from_directory(str(REACT_DIST), "index.html")
+    return send_from_directory(app.static_folder, path)
 
 
 # ---------------------------------------------------------------------------

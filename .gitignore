@@ -1,16 +1,8 @@
-
-# Data (keep structure, not contents)
-# Logs
-# Python
-# Secrets
-# macOS
-*.log
+frontend/node_modules/
+frontend/dist/
 *.pyc
-*.pyo
-.DS_Store
-.env
-.venv/
-.venv/\n_fetch_emails.py\n_email_*.html\n.DS_Store
 __pycache__/
-data/db/*.db
-data/invoices/**/*.pdf
+.env
+data/
+*.db
+.venv/
