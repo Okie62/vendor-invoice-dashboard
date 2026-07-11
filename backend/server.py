@@ -43,23 +43,42 @@ REACT_DIST = Path(__file__).resolve().parent.parent / "frontend" / "dist"
 # ---------------------------------------------------------------------------
 
 def _resolve_pdf_path(stored_path):
-    """Resolve a PDF path that may be relative to DATA_DIR (#26).
+    """Resolve a PDF/HTML path that may be relative to DATA_DIR (#26).
 
     Old invoices stored absolute paths; new ones store relative to DATA_DIR.
-    This handles both cases.
+    Hardens against path traversal: resolved path must live under DATA_DIR
+    (with an absolute-path legacy exception only when the absolute path
+    itself is still under DATA_DIR).
     """
     if not stored_path:
         return None
-    p = Path(stored_path)
-    if p.is_absolute() and p.exists():
-        return p
-    # Try resolving relative to DATA_DIR
     from config import DATA_DIR
-    rel = DATA_DIR / stored_path
-    if rel.exists():
-        return rel
-    # Last resort: return the original path
-    return p
+    data_root = DATA_DIR.resolve()
+    p = Path(stored_path)
+
+    candidates = []
+    if p.is_absolute():
+        candidates.append(p)
+    # Always try relative-to-DATA_DIR (handles both relative keys and
+    # accidentally-absolute-but-actually-relative strings)
+    candidates.append(data_root / stored_path.lstrip("/\\"))
+    # Also try pure path relative when absolute path is any other path
+    if not p.is_absolute():
+        candidates.append(data_root / p)
+
+    for cand in candidates:
+        try:
+            resolved = cand.resolve()
+        except (OSError, RuntimeError):
+            continue
+        # Path must be inside DATA_DIR (prevents ../../../ etc.)
+        try:
+            resolved.relative_to(data_root)
+        except ValueError:
+            continue
+        if resolved.exists() and resolved.is_file():
+            return resolved
+    return None
 
 
 # Initialize database on startup (works with gunicorn, not just __main__)
@@ -644,6 +663,11 @@ def delete_invoice(invoice_id):
 @app.route("/api/invoices/<invoice_id>/pdf")
 @require_auth
 def download_pdf(invoice_id):
+    """Serve the stored invoice document (PDF or HTML).
+
+    Auth-gated. By default streams inline for the in-app viewer (iframe).
+    Pass ?download=1 to force attachment download.
+    """
     conn = get_db()
     inv = conn.execute(
         "SELECT pdf_path FROM invoices WHERE id = ?", (invoice_id,)
@@ -654,8 +678,21 @@ def download_pdf(invoice_id):
     pdf_path = _resolve_pdf_path(inv["pdf_path"])
     if not pdf_path or not pdf_path.exists():
         abort(404)
+
+    as_attachment = request.args.get("download", "").lower() in ("1", "true", "yes")
+    suffix = pdf_path.suffix.lower()
+    if suffix == ".html" or suffix == ".htm":
+        mimetype = "text/html"
+    elif suffix == ".pdf":
+        mimetype = "application/pdf"
+    else:
+        mimetype = None  # let send_from_directory guess
+
     return send_from_directory(
-        str(pdf_path.parent), pdf_path.name, as_attachment=True
+        str(pdf_path.parent),
+        pdf_path.name,
+        as_attachment=as_attachment,
+        mimetype=mimetype,
     )
 
 
@@ -1360,6 +1397,103 @@ def admin_deactivate_user(user_id):
     conn.commit()
     conn.close()
     return jsonify({"success": True})
+
+
+# ---------------------------------------------------------------------------
+# Email log API
+# ---------------------------------------------------------------------------
+
+@app.route("/api/emails")
+@require_auth
+def list_emails():
+    """GET /api/emails — list processed emails newest-first.
+
+    Query params:
+      parse_status: optional filter (parsed|unparsed|no_attachment|failed)
+      limit: default 50, max 200
+      offset: default 0
+    """
+    parse_status = (request.args.get("parse_status") or "").strip()
+    try:
+        limit = min(max(int(request.args.get("limit", 50)), 1), 200)
+    except (TypeError, ValueError):
+        limit = 50
+    try:
+        offset = max(int(request.args.get("offset", 0)), 0)
+    except (TypeError, ValueError):
+        offset = 0
+
+    allowed = {"parsed", "unparsed", "no_attachment", "failed"}
+    conn = get_db()
+
+    where = []
+    params = []
+    if parse_status:
+        if parse_status not in allowed:
+            conn.close()
+            return jsonify({
+                "error": "Invalid parse_status. Allowed: "
+                + ", ".join(sorted(allowed))
+            }), 400
+        where.append("pe.parse_status = ?")
+        params.append(parse_status)
+
+    where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+
+    count_row = conn.execute(
+        f"SELECT COUNT(*) AS c FROM processed_emails pe {where_sql}",
+        params,
+    ).fetchone()
+    total = count_row["c"] if count_row else 0
+
+    rows = conn.execute(
+        f"""
+        SELECT pe.message_id,
+               pe.vendor_name,
+               pe.filename,
+               pe.invoice_id,
+               pe.processed_at,
+               pe.subject,
+               pe.from_header,
+               pe.received_date,
+               pe.attachment_count,
+               pe.parse_status,
+               pe.received_at,
+               i.status AS invoice_status,
+               i.pdf_path AS invoice_pdf_path
+        FROM processed_emails pe
+        LEFT JOIN invoices i ON i.id = pe.invoice_id
+        {where_sql}
+        ORDER BY COALESCE(pe.processed_at, pe.received_at, '') DESC
+        LIMIT ? OFFSET ?
+        """,
+        (*params, limit, offset),
+    ).fetchall()
+    conn.close()
+
+    emails = []
+    for r in rows:
+        emails.append({
+            "message_id": r["message_id"],
+            "vendor_name": r["vendor_name"],
+            "filename": r["filename"],
+            "invoice_id": r["invoice_id"],
+            "processed_at": r["processed_at"],
+            "subject": r["subject"],
+            "from_header": r["from_header"],
+            "received_date": r["received_date"] or r["received_at"],
+            "attachment_count": r["attachment_count"],
+            "parse_status": r["parse_status"],
+            "invoice_status": r["invoice_status"],
+            "invoice_pdf_path": r["invoice_pdf_path"],
+        })
+
+    return jsonify({
+        "emails": emails,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+    })
 
 
 # ---------------------------------------------------------------------------

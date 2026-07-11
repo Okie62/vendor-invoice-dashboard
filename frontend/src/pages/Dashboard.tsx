@@ -1,3 +1,4 @@
+import { useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { useNavigate } from 'react-router-dom';
 import {
@@ -12,6 +13,8 @@ import {
   ChevronRight,
 } from 'lucide-react';
 import { getDashboard, getVendors, STATUS_STYLES, type DashboardData, type DBInvoice } from '../lib/api';
+import DocumentViewer from '../components/DocumentViewer';
+import InvoiceNumberLink from '../components/InvoiceNumberLink';
 
 const currency = (v: number) =>
   new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(v);
@@ -24,6 +27,7 @@ const fmtDate = (d: string | null | undefined) => {
 
 export default function Dashboard() {
   const navigate = useNavigate();
+  const [viewerInvoice, setViewerInvoice] = useState<{ id: string; pdf_path?: string | null } | null>(null);
 
   const { data: dash, isLoading } = useQuery({
     queryKey: ['dashboard'],
@@ -186,8 +190,14 @@ export default function Dashboard() {
                       <p className="text-sm font-medium truncate" style={{ color: 'var(--th-text-primary)' }}>
                         {inv.vendor_name || 'Unknown Vendor'}
                       </p>
-                      <p className="text-xs truncate" style={{ color: 'var(--th-text-tertiary)' }}>
-                        {inv.billing_period || inv.id} · {fmtDate(inv.due_date)}
+                      <p className="text-xs truncate flex items-center gap-1.5" style={{ color: 'var(--th-text-tertiary)' }}>
+                        <InvoiceNumberLink
+                          invoiceId={inv.id}
+                          pdfPath={inv.pdf_path}
+                          onOpen={(id, path) => setViewerInvoice({ id, pdf_path: path })}
+                        />
+                        <span>·</span>
+                        <span>{inv.billing_period || '—'} · {fmtDate(inv.due_date)}</span>
                       </p>
                     </div>
                     <span
@@ -285,6 +295,14 @@ export default function Dashboard() {
           ))}
         </div>
       </div>
+
+      {viewerInvoice && (
+        <DocumentViewer
+          invoiceId={viewerInvoice.id}
+          pdfPath={viewerInvoice.pdf_path}
+          onClose={() => setViewerInvoice(null)}
+        />
+      )}
     </div>
   );
 }

@@ -148,10 +148,18 @@ def validate_password_strength(password: str) -> Optional[str]:
 # -----------------------------------------------------------------------
 
 def extract_token_from_request() -> Optional[str]:
-    """Extract Bearer token from Authorization header."""
+    """Extract Bearer token from Authorization header or ?token= query param.
+
+    Query param is used for iframe/document URL loads (e.g. PDF viewer) where
+    setting Authorization headers is not possible.
+    """
     auth_header = request.headers.get("Authorization", "")
     if auth_header.startswith("Bearer "):
         return auth_header[7:]
+    # Allow token via query string for iframe src / download links
+    token = request.args.get("token")
+    if token:
+        return token
     return None
 
 

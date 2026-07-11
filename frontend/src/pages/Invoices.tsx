@@ -28,6 +28,8 @@ import {
   VALID_STATUSES,
   type InvoiceStatus,
 } from '../lib/api';
+import DocumentViewer from '../components/DocumentViewer';
+import InvoiceNumberLink from '../components/InvoiceNumberLink';
 
 const currency = (v: string | number) =>
   new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(
@@ -79,6 +81,7 @@ export default function Invoices() {
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [hoveredRow, setHoveredRow] = useState<string | null>(null);
   const [openActionMenu, setOpenActionMenu] = useState<string | null>(null);
+  const [viewerInvoice, setViewerInvoice] = useState<{ id: string; pdf_path?: string | null } | null>(null);
 
   const queryParams: InvoiceFilters = useMemo(() => ({
     search: search || undefined,
@@ -295,6 +298,9 @@ export default function Invoices() {
                   <th className={thCls} onClick={() => handleSort('vendor_name')}>
                     <span className="inline-flex items-center">Vendor <SortIcon field="vendor_name" /></span>
                   </th>
+                  <th className={thCls + ' hidden md:table-cell'}>
+                    <span className="inline-flex items-center">Invoice</span>
+                  </th>
                   <th className={thCls + ' hidden sm:table-cell'} onClick={() => handleSort('billing_period')}>
                     <span className="inline-flex items-center">Period <SortIcon field="billing_period" /></span>
                   </th>
@@ -336,6 +342,13 @@ export default function Invoices() {
                           <Building2 className="h-3 w-3" />
                           {inv.vendor_name || 'Unknown'}
                         </button>
+                      </td>
+                      <td className="hidden whitespace-nowrap px-4 py-2.5 text-sm md:table-cell">
+                        <InvoiceNumberLink
+                          invoiceId={inv.id}
+                          pdfPath={inv.pdf_path}
+                          onOpen={(id, path) => setViewerInvoice({ id, pdf_path: path })}
+                        />
                       </td>
                       <td className="hidden whitespace-nowrap px-4 py-2.5 text-sm sm:table-cell" style={{ color: 'var(--th-text-secondary)' }}>
                         {inv.billing_period || '—'}
@@ -421,6 +434,14 @@ export default function Invoices() {
             {toast.message}
           </div>
         </div>
+      )}
+
+      {viewerInvoice && (
+        <DocumentViewer
+          invoiceId={viewerInvoice.id}
+          pdfPath={viewerInvoice.pdf_path}
+          onClose={() => setViewerInvoice(null)}
+        />
       )}
     </div>
   );

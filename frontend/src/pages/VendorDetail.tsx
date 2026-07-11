@@ -24,6 +24,8 @@ import {
   type InvoiceStatus,
   type DBInvoice,
 } from '../lib/api';
+import DocumentViewer from '../components/DocumentViewer';
+import InvoiceNumberLink from '../components/InvoiceNumberLink';
 
 const currency = (v: number) =>
   new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(v);
@@ -66,6 +68,7 @@ export default function VendorDetail() {
   });
 
   const [invoiceSortAsc, setInvoiceSortAsc] = useState(false);
+  const [viewerInvoice, setViewerInvoice] = useState<{ id: string; pdf_path?: string | null } | null>(null);
 
   const statusMut = useMutation({
     mutationFn: ({ id, status }: { id: string; status: InvoiceStatus }) => updateInvoiceStatus(id, status),
@@ -252,7 +255,13 @@ export default function VendorDetail() {
                   const ss = STATUS_STYLES[inv.status] || STATUS_STYLES.received;
                   return (
                     <tr key={inv.id} className="transition-colors hover:bg-[var(--th-hover)]" style={{ borderBottom: '1px solid var(--th-border)' }}>
-                      <td className="px-4 py-3 font-mono text-xs" style={{ color: 'var(--th-accent)' }}>#{inv.id}</td>
+                      <td className="px-4 py-3">
+                        <InvoiceNumberLink
+                          invoiceId={inv.id}
+                          pdfPath={inv.pdf_path}
+                          onOpen={(id, path) => setViewerInvoice({ id, pdf_path: path })}
+                        />
+                      </td>
                       <td className="px-4 py-3 hidden sm:table-cell" style={{ color: 'var(--th-text-tertiary)' }}>{inv.billing_period || '—'}</td>
                       <td className="px-4 py-3 hidden sm:table-cell" style={{ color: 'var(--th-text-tertiary)' }}>{fmtDate(inv.due_date)}</td>
                       <td className="px-4 py-3 text-right font-medium" style={{ color: 'var(--th-text-primary)' }}>
@@ -293,6 +302,14 @@ export default function VendorDetail() {
           </div>
         )}
       </div>
+
+      {viewerInvoice && (
+        <DocumentViewer
+          invoiceId={viewerInvoice.id}
+          pdfPath={viewerInvoice.pdf_path}
+          onClose={() => setViewerInvoice(null)}
+        />
+      )}
     </div>
   );
 }

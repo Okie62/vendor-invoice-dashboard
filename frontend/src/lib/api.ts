@@ -366,6 +366,16 @@ export async function getInvoiceRawText(id: string): Promise<{ text: string }> {
   return data;
 }
 
+/** Auth-gated document URL for iframe/src or download (invoice PDF/HTML). */
+export function getInvoiceDocumentUrl(id: string, download = false): string {
+  const token = localStorage.getItem('access_token') || '';
+  const params = new URLSearchParams();
+  if (token) params.set('token', token);
+  if (download) params.set('download', '1');
+  const qs = params.toString();
+  return `/api/invoices/${encodeURIComponent(id)}/pdf${qs ? `?${qs}` : ''}`;
+}
+
 export async function updateInvoiceStatus(id: string, status: string, dueDate?: string): Promise<{ success: boolean; changes: Record<string, unknown> }> {
   const body: Record<string, string> = { status };
   if (dueDate) body.due_date = dueDate;
@@ -457,3 +467,51 @@ export async function getFormats(): Promise<FormatRecord[]> {
   const { data } = await api.get<FormatRecord[]>('/api/formats');
   return data;
 }
+
+// ── Email Log ──
+export type ParseStatus = 'parsed' | 'unparsed' | 'no_attachment' | 'failed';
+
+export interface ProcessedEmail {
+  message_id: string;
+  vendor_name: string | null;
+  filename: string | null;
+  invoice_id: string | null;
+  processed_at: string | null;
+  subject: string | null;
+  from_header: string | null;
+  received_date: string | null;
+  attachment_count: number | null;
+  parse_status: ParseStatus | string | null;
+  invoice_status: string | null;
+  invoice_pdf_path: string | null;
+}
+
+export interface EmailsResponse {
+  emails: ProcessedEmail[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+export interface EmailFilters {
+  parse_status?: string;
+  limit?: number;
+  offset?: number;
+}
+
+export const PARSE_STATUS_STYLES: Record<string, { bg: string; text: string; border: string; label: string }> = {
+  parsed: { bg: 'rgba(39,166,68,0.12)', text: '#27a644', border: 'rgba(39,166,68,0.25)', label: 'Parsed' },
+  unparsed: { bg: 'rgba(245,158,11,0.12)', text: '#f59e0b', border: 'rgba(245,158,11,0.25)', label: 'Unparsed' },
+  no_attachment: { bg: 'rgba(148,163,184,0.12)', text: '#94a3b8', border: 'rgba(148,163,184,0.25)', label: 'No attachment' },
+  failed: { bg: 'rgba(239,68,68,0.12)', text: '#ef4444', border: 'rgba(239,68,68,0.25)', label: 'Failed' },
+};
+
+export async function getEmails(filters: EmailFilters = {}): Promise<EmailsResponse> {
+  const params: Record<string, string> = {};
+  if (filters.parse_status) params.parse_status = filters.parse_status;
+  if (filters.limit !== undefined) params.limit = String(filters.limit);
+  if (filters.offset !== undefined) params.offset = String(filters.offset);
+  const { data } = await api.get<EmailsResponse>('/api/emails', { params: stripEmpty(params) });
+  return data;
+}
+
