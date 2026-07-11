@@ -281,6 +281,11 @@ init_receptionist_table()
 def receptionist_message():
     """Receive a take_message tool call from the Ava voice agent."""
     token = request.headers.get("X-Receptionist-Token", "")
+    # xAI Voice Agent Builder only supports Bearer auth for webhooks —
+    # accept the same secret via Authorization: Bearer as well.
+    auth_header = request.headers.get("Authorization", "")
+    if not token and auth_header.startswith("Bearer "):
+        token = auth_header[7:].strip()
     expected = os.environ.get("RECEPTIONIST_TOKEN", "")
     if not expected or token != expected:
         abort(401)
