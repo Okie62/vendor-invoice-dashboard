@@ -8,6 +8,7 @@ import Dashboard from './pages/Dashboard';
 import Invoices from './pages/Invoices';
 import Vendors from './pages/Vendors';
 import VendorDetail from './pages/VendorDetail';
+import Emails from './pages/Emails';
 import Users from './pages/admin/Users';
 import Reviews from './pages/admin/Reviews';
 
@@ -33,6 +34,7 @@ function App() {
                 <Route path="invoices" element={<Invoices />} />
                 <Route path="vendors" element={<Vendors />} />
                 <Route path="vendors/:id" element={<VendorDetail />} />
+                <Route path="emails" element={<Emails />} />
                 <Route path="admin/users" element={<Users />} />
                 <Route path="admin/reviews" element={<Reviews />} />
               </Route>

@@ -71,7 +71,12 @@ CREATE TABLE IF NOT EXISTS processed_emails (
     vendor_name TEXT,
     invoice_id TEXT,
     filename TEXT,
-    processed_at TEXT DEFAULT (datetime('now'))
+    processed_at TEXT DEFAULT (datetime('now')),
+    subject TEXT,
+    from_header TEXT,
+    received_date TEXT,
+    attachment_count INTEGER,
+    parse_status TEXT
 );
 
 CREATE TABLE IF NOT EXISTS users (
@@ -184,12 +189,19 @@ MIGRATIONS = [
     "UPDATE invoices SET status = 'paid' WHERE outstanding_balance = 0 AND status = 'received'",
 
     "UPDATE invoices SET status = 'needs_review' WHERE source = 'email_unparsed' AND status = 'received'",
+
+    # v8–v12: enrich processed_emails for Email Log page
+    "ALTER TABLE processed_emails ADD COLUMN subject TEXT",
+    "ALTER TABLE processed_emails ADD COLUMN from_header TEXT",
+    "ALTER TABLE processed_emails ADD COLUMN received_date TEXT",
+    "ALTER TABLE processed_emails ADD COLUMN attachment_count INTEGER",
+    "ALTER TABLE processed_emails ADD COLUMN parse_status TEXT",
 ]
 
 
 def get_db():
     """Return a sqlite3 connection with row factory."""
-    conn = sqlite3.connect(str(DB_PATH))
+    conn = sqlite3.connect(str(DB_PATH), timeout=30)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     return conn

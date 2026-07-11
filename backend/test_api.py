@@ -727,3 +727,260 @@ class TestInvoiceFilters:
         assert len(data) == 2
         assert data[0]["id"] == "inv_sort_jul"
         assert data[1]["id"] == "inv_sort_aug"
+
+
+class TestEmailsEndpoint:
+    """GET /api/emails — auth gate, filters, pagination, new columns."""
+
+    def _seed_emails(self, suffix=""):
+        """Seed once per call using unique keys so shared-DB suite stays clean."""
+        from db import get_db
+        conn = get_db()
+        try:
+            vendor_name = f"EmailLogVendor_{suffix or 'base'}"
+            row = conn.execute(
+                "SELECT id FROM vendors WHERE name = ?", (vendor_name,)
+            ).fetchone()
+            if row:
+                vendor_id = row["id"]
+            else:
+                cursor = conn.execute(
+                    "INSERT INTO vendors (name) VALUES (?)",
+                    (vendor_name,),
+                )
+                vendor_id = cursor.lastrowid
+
+            inv_id = f"inv_email_log_{suffix or 'base'}"
+            conn.execute(
+                "INSERT OR IGNORE INTO invoices (id, vendor_id, source, new_charges, "
+                "outstanding_balance, status, pdf_path) "
+                "VALUES (?, ?, 'email', 10, 10, 'received', ?)",
+                (inv_id, vendor_id, f"invoices/{vendor_name}/a.pdf"),
+            )
+
+            # historical skinny row (NULL new columns)
+            hist_id = f"<hist@{suffix or 'base'}.test>"
+            conn.execute(
+                "INSERT OR IGNORE INTO processed_emails "
+                "(message_id, vendor_name, filename, processed_at) "
+                "VALUES (?, ?, ?, datetime('now', '-2 hours'))",
+                (hist_id, "OldVendor", "old.pdf"),
+            )
+
+            seeds = [
+                (f"<msg-parsed@{suffix or 'base'}.test>", vendor_name, "a.pdf", inv_id,
+                 "Invoice A", "a@v.com", "2026-07-10", 1, "parsed"),
+                (f"<msg-unparsed@{suffix or 'base'}.test>", vendor_name, "b.pdf", None,
+                 "Invoice B", "b@v.com", "2026-07-11", 1, "unparsed"),
+                (f"<msg-none@{suffix or 'base'}.test>", vendor_name, None, None,
+                 "No Att", "c@v.com", "2026-07-12", 0, "no_attachment"),
+                (f"<msg-failed@{suffix or 'base'}.test>", vendor_name, "c.pdf", None,
+                 "Failed", "d@v.com", "2026-07-13", 1, "failed"),
+            ]
+            for mid, vn, fn, iid, subj, frm, rd, ac, ps in seeds:
+                conn.execute(
+                    "INSERT OR REPLACE INTO processed_emails "
+                    "(message_id, vendor_name, filename, invoice_id, processed_at, "
+                    " subject, from_header, received_date, attachment_count, parse_status) "
+                    "VALUES (?, ?, ?, ?, datetime('now'), ?, ?, ?, ?, ?)",
+                    (mid, vn, fn, iid, subj, frm, rd, ac, ps),
+                )
+            conn.commit()
+            return {
+                "hist_id": hist_id,
+                "parsed_id": seeds[0][0],
+                "unparsed_id": seeds[1][0],
+                "inv_id": inv_id,
+            }
+        finally:
+            conn.close()
+
+    def test_requires_auth(self, client):
+        resp = client.get("/api/emails")
+        assert resp.status_code == 401
+
+    def test_list_newest_first(self, client, auth_headers):
+        ids = self._seed_emails(suffix="list")
+        resp = client.get("/api/emails?limit=100", headers=auth_headers)
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert "emails" in data
+        assert data["total"] >= 5
+        assert isinstance(data["emails"], list)
+        msgs = {e["message_id"]: e for e in data["emails"]}
+        assert ids["hist_id"] in msgs
+        hist = msgs[ids["hist_id"]]
+        assert hist["parse_status"] in (None, "")
+        parsed = msgs[ids["parsed_id"]]
+        assert parsed["parse_status"] == "parsed"
+        assert parsed["invoice_id"] == ids["inv_id"]
+        assert parsed["invoice_status"] == "received"
+        assert parsed["subject"] == "Invoice A"
+
+    def test_filter_parse_status(self, client, auth_headers):
+        ids = self._seed_emails(suffix="filter")
+        resp = client.get(
+            "/api/emails?parse_status=unparsed&limit=100",
+            headers=auth_headers,
+        )
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["total"] >= 1
+        assert all(e["parse_status"] == "unparsed" for e in data["emails"])
+        assert any(e["message_id"] == ids["unparsed_id"] for e in data["emails"])
+
+    def test_filter_invalid_status(self, client, auth_headers):
+        resp = client.get("/api/emails?parse_status=bogus", headers=auth_headers)
+        assert resp.status_code == 400
+
+    def test_pagination(self, client, auth_headers):
+        self._seed_emails(suffix="page")
+        # filter by vendor-ish subject logistic not available; just check page sizes
+        resp = client.get("/api/emails?limit=2&offset=0", headers=auth_headers)
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["limit"] == 2
+        assert data["offset"] == 0
+        assert len(data["emails"]) <= 2
+        assert data["total"] >= 2
+
+        resp2 = client.get("/api/emails?limit=2&offset=2", headers=auth_headers)
+        assert resp2.status_code == 200
+        data2 = resp2.get_json()
+        assert len(data2["emails"]) <= 2
+        if data["emails"] and data2["emails"]:
+            ids1 = {e["message_id"] for e in data["emails"]}
+            ids2 = {e["message_id"] for e in data2["emails"]}
+            assert ids1.isdisjoint(ids2)
+
+
+class TestIngestProcessedEmailsColumns:
+    """ingest.py must populate the enriched processed_emails columns."""
+
+    def test_html_parsed_sets_parsed_status(self, client, auth_headers, monkeypatch):
+        from db import get_db
+        from ingest import process_email
+
+        class FakeParsed:
+            invoice_id = "html_parsed_001"
+            billing_period = "Jul 2026"
+            invoice_date = "2026-07-01"
+            is_credit_memo = False
+            references_invoice = None
+            partner_name = ""
+            partner_id = ""
+            partner_username = ""
+            previous_balance = 0
+            credit_card_surcharges = 0
+            payment_received = 0
+            new_charges = 12.5
+            outstanding_balance = 12.5
+            customers = []
+            line_items = []
+
+        import ingest as ingest_mod
+        monkeypatch.setattr(ingest_mod, "parse_html_invoice", lambda *a, **k: FakeParsed())
+        monkeypatch.setattr(ingest_mod, "extract_vendor", lambda *a, **k: ("FakeHTMLVendor", True))
+        monkeypatch.setattr(ingest_mod, "compute_fingerprint", lambda t: "fp")
+        monkeypatch.setattr(ingest_mod, "register_format", lambda *a, **k: {"is_new": False})
+        monkeypatch.setattr(ingest_mod, "_send_new_invoice_notification", lambda *a, **k: None)
+        monkeypatch.setattr(ingest_mod, "_send_confirmation_reply", lambda *a, **k: None)
+
+        conn = get_db()
+        try:
+            email_data = {
+                "message_id": "<ingest-html-parsed@test>",
+                "subject": "FW: Your receipt from FakeHTMLVendor",
+                "from": "jay@example.com",
+                "body_html": "<html><body>Receipt</body></html>",
+                "body_text": "Receipt",
+                "received_date": "2026-07-10 12:00:00",
+                "attachments": [],
+            }
+            process_email(conn, email_data)
+            row = conn.execute(
+                "SELECT * FROM processed_emails WHERE message_id = ?",
+                (email_data["message_id"],),
+            ).fetchone()
+        finally:
+            conn.close()
+        assert row is not None
+        assert row["parse_status"] == "parsed"
+        assert row["subject"] == email_data["subject"]
+        assert row["from_header"] == email_data["from"]
+        assert row["received_date"] == email_data["received_date"]
+        assert row["attachment_count"] == 0
+        assert row["invoice_id"] == "html_parsed_001"
+
+    def test_html_unparsed_sets_no_attachment(self, client, auth_headers, monkeypatch):
+        from db import get_db
+        from ingest import process_email
+        import ingest as ingest_mod
+
+        def boom(*a, **k):
+            raise ValueError("unknown format")
+
+        monkeypatch.setattr(ingest_mod, "parse_html_invoice", boom)
+        monkeypatch.setattr(ingest_mod, "extract_vendor", lambda *a, **k: ("UnknownVendorHtml", False))
+        monkeypatch.setattr(ingest_mod, "_notify_unknown_format", lambda *a, **k: None)
+        monkeypatch.setattr(ingest_mod, "create_review", lambda *a, **k: None)
+
+        conn = get_db()
+        try:
+            email_data = {
+                "message_id": "<ingest-html-unparsed@test>",
+                "subject": "Random receipt",
+                "from": "someone@example.com",
+                "body_html": "<html>no known structure</html>",
+                "body_text": "no known structure",
+                "received_date": "2026-07-11 09:00:00",
+                "attachments": [],
+            }
+            process_email(conn, email_data)
+            row = conn.execute(
+                "SELECT * FROM processed_emails WHERE message_id = ?",
+                (email_data["message_id"],),
+            ).fetchone()
+        finally:
+            conn.close()
+        assert row is not None
+        assert row["parse_status"] == "no_attachment"
+        assert row["attachment_count"] == 0
+        assert row["subject"] == "Random receipt"
+        assert row["invoice_id"]  # unparsed invoice created
+
+    def test_pdf_unparsed_sets_unparsed(self, client, auth_headers, monkeypatch):
+        from db import get_db
+        from ingest import process_email
+        import ingest as ingest_mod
+
+        def boom(*a, **k):
+            raise ValueError("unknown pdf")
+
+        monkeypatch.setattr(ingest_mod, "parse_pdf", boom)
+        monkeypatch.setattr(ingest_mod, "extract_vendor", lambda *a, **k: ("PdfUnparsedVendorX", True))
+        monkeypatch.setattr(ingest_mod, "_notify_unknown_format", lambda *a, **k: None)
+        monkeypatch.setattr(ingest_mod, "create_review", lambda *a, **k: None)
+
+        conn = get_db()
+        try:
+            email_data = {
+                "message_id": "<ingest-pdf-unparsed@test>",
+                "subject": "FW: Invoice",
+                "from": "vendor@pdf.com",
+                "body_html": "",
+                "body_text": "",
+                "received_date": "2026-07-12",
+                "attachments": [{"filename": "mystery.pdf", "bytes": b"%PDF-1.4 fake"}],
+            }
+            process_email(conn, email_data)
+            row = conn.execute(
+                "SELECT * FROM processed_emails WHERE message_id = ?",
+                (email_data["message_id"],),
+            ).fetchone()
+        finally:
+            conn.close()
+        assert row is not None
+        assert row["parse_status"] == "unparsed"
+        assert row["attachment_count"] == 1
+        assert row["filename"] == "mystery.pdf"

@@ -14,6 +14,7 @@ import {
   ShieldCheck,
   ClipboardList,
   UserCheck,
+  Mail,
 } from 'lucide-react';
 import { useAuth } from '../../hooks/useAuth';
 import { useTheme } from '../../hooks/useTheme';
@@ -22,6 +23,7 @@ const mainNav = [
   { name: 'Dashboard', href: '/', icon: LayoutDashboard },
   { name: 'Invoices', href: '/invoices', icon: FileText },
   { name: 'Vendors', href: '/vendors', icon: Building2 },
+  { name: 'Emails', href: '/emails', icon: Mail },
 ];
 
 const adminNav = [

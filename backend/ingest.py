@@ -15,6 +15,7 @@ import logging
 import re
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
 from config import INVOICE_DIR
 from db import get_db, init_db
@@ -58,6 +59,7 @@ def run_ingestion():
             mark_seen(imap, email_data["imap_id"])
             processed += 1
         except Exception as e:
+            # Do NOT write processed_emails / mark seen — keep retry behavior.
             log.error(f"Failed to process email {email_data['message_id']}: {e}")
 
     imap.logout()
@@ -97,6 +99,39 @@ def process_email(conn, email_data: dict):
         _process_pdf_attachments(conn, vendor_id, vendor_name, email_data, attachments)
 
 
+def _log_processed_email(
+    conn,
+    email_data: dict,
+    vendor_name: str,
+    filename: Optional[str],
+    parse_status: str,
+    invoice_id: Optional[str] = None,
+    attachment_count: Optional[int] = None,
+):
+    """Insert/replace a processed_emails row with full metadata for the Email Log."""
+    if attachment_count is None:
+        attachment_count = len(email_data.get("attachments") or [])
+    conn.execute(
+        "INSERT OR REPLACE INTO processed_emails "
+        "(message_id, vendor_name, filename, invoice_id, processed_at, "
+        " subject, from_header, received_date, attachment_count, parse_status, received_at) "
+        "VALUES (?, ?, ?, ?, datetime('now'), ?, ?, ?, ?, ?, ?)",
+        (
+            email_data["message_id"],
+            vendor_name,
+            filename,
+            invoice_id,
+            email_data.get("subject") or "",
+            email_data.get("from") or "",
+            email_data.get("received_date") or "",
+            attachment_count,
+            parse_status,
+            email_data.get("received_date") or None,
+        ),
+    )
+    conn.commit()
+
+
 def _process_html_only_email(conn, vendor_id: int, vendor_name: str, email_data: dict):
     """Process an email with no PDF attachments via HTML body parsing."""
     body_html = email_data.get("body_html", "")
@@ -108,6 +143,12 @@ def _process_html_only_email(conn, vendor_id: int, vendor_name: str, email_data:
         _notify_unknown_format(vendor_name, "no_body", email_data, "Email has no HTML body")
         if inv_id:
             create_review(conn, inv_id, vendor_id, "no_body")
+        _log_processed_email(
+            conn, email_data, vendor_name, None,
+            parse_status="no_attachment",
+            invoice_id=inv_id,
+            attachment_count=0,
+        )
         return
 
     # Save HTML body to filesystem
@@ -132,6 +173,13 @@ def _process_html_only_email(conn, vendor_id: int, vendor_name: str, email_data:
         if inv_id:
             create_review(conn, inv_id, vendor_id, "no_parser",
                           extracted_data={"vendor": vendor_name, "filename": html_filename})
+        # HTML-only email that produced an unparsed record
+        _log_processed_email(
+            conn, email_data, vendor_name, html_filename,
+            parse_status="no_attachment",
+            invoice_id=inv_id,
+            attachment_count=0,
+        )
         return
 
     # Store parsed invoice
@@ -153,18 +201,21 @@ def _process_html_only_email(conn, vendor_id: int, vendor_name: str, email_data:
     _send_confirmation_reply(email_data, [parsed], vendor_name)
 
     # Log to processed_emails
-    conn.execute(
-        "INSERT OR REPLACE INTO processed_emails "
-        "(message_id, vendor_name, filename, processed_at) "
-        "VALUES (?, ?, ?, datetime('now'))",
-        (email_data["message_id"], vendor_name, html_filename)
+    _log_processed_email(
+        conn, email_data, vendor_name, html_filename,
+        parse_status="parsed",
+        invoice_id=parsed.invoice_id,
+        attachment_count=0,
     )
-    conn.commit()
 
 
 def _process_pdf_attachments(conn, vendor_id, vendor_name, email_data, attachments):
     """Process email with PDF attachments — parse, store, and detect new formats."""
     parsed_invoices = []  # track for reply
+    last_invoice_id = None
+    any_parsed = False
+    any_unparsed = False
+
     for att in attachments:
         # Save PDF to filesystem
         pdf_dir = INVOICE_DIR / vendor_name
@@ -179,6 +230,8 @@ def _process_pdf_attachments(conn, vendor_id, vendor_name, email_data, attachmen
         except ValueError as e:
             log.warning(f"Could not parse {att['filename']}: {e} — storing as unstructured.")
             inv_id = store_unparsed_invoice(conn, vendor_id, email_data, str(pdf_path))
+            last_invoice_id = inv_id or last_invoice_id
+            any_unparsed = True
             _notify_unknown_format(vendor_name, att["filename"], email_data, str(e))
             if inv_id:
                 create_review(conn, inv_id, vendor_id, "no_parser",
@@ -191,6 +244,8 @@ def _process_pdf_attachments(conn, vendor_id, vendor_name, email_data, attachmen
             email_data["message_id"], source="email"
         )
         parsed_invoices.append(parsed)
+        any_parsed = True
+        last_invoice_id = parsed.invoice_id
 
         # ---- Format recognition for parsed PDF invoices ----
         # Extract raw text for fingerprinting
@@ -217,18 +272,25 @@ def _process_pdf_attachments(conn, vendor_id, vendor_name, email_data, attachmen
 
     # Log to processed_emails
     all_filenames = ", ".join(a["filename"] for a in attachments)
-    conn.execute(
-        "INSERT OR REPLACE INTO processed_emails "
-        "(message_id, vendor_name, filename, processed_at) "
-        "VALUES (?, ?, ?, datetime('now'))",
-        (email_data["message_id"], vendor_name, all_filenames)
+    if any_parsed:
+        parse_status = "parsed"
+    elif any_unparsed:
+        parse_status = "unparsed"
+    else:
+        parse_status = "unparsed"
+
+    _log_processed_email(
+        conn, email_data, vendor_name, all_filenames,
+        parse_status=parse_status,
+        invoice_id=last_invoice_id,
+        attachment_count=len(attachments),
     )
-    conn.commit()
 
 
 def _store_html_as_unparsed(conn, vendor_id, email_data, html_path, body_text):
     """Store an unparsed HTML-only receipt (no PDF). Returns invoice_id."""
-    inv_id = f"unparsed_{datetime.now().strftime('%Y%m%d%H%M%S')}"
+    import uuid
+    inv_id = f"unparsed_{datetime.now().strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:6]}"
     conn.execute("""
         INSERT INTO invoices
         (id, vendor_id, source, email_message_id, pdf_path, new_charges, outstanding_balance)
@@ -366,12 +428,19 @@ def store_unparsed_invoice(conn, vendor_id: int, email_data: dict, pdf_path: str
 
     Returns the invoice_id that was created.
     """
-    inv_id = f"unparsed_{datetime.now().strftime('%Y%m%d%H%M%S')}"
+    import uuid
+    inv_id = f"unparsed_{datetime.now().strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:6]}"
+    # Store PDF path relative to DATA_DIR for consistency with store_invoice
+    from config import DATA_DIR
+    try:
+        rel_pdf_path = str(Path(pdf_path).relative_to(DATA_DIR))
+    except ValueError:
+        rel_pdf_path = pdf_path
     conn.execute("""
         INSERT INTO invoices
         (id, vendor_id, source, email_message_id, pdf_path, new_charges, outstanding_balance)
         VALUES (?, ?, 'email_unparsed', ?, ?, 0, 0)
-    """, (inv_id, vendor_id, email_data["message_id"], pdf_path))
+    """, (inv_id, vendor_id, email_data["message_id"], rel_pdf_path))
     conn.commit()
-    log.info(f"Stored unparsed invoice {inv_id} (PDF at {pdf_path})")
+    log.info(f"Stored unparsed invoice {inv_id} (PDF at {rel_pdf_path})")
     return inv_id
