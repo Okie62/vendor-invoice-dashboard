@@ -249,6 +249,41 @@ def health_check():
     return jsonify({"status": "healthy"})
 
 
+# ---------------------------------------------------------------------------
+# AI Receptionist webhook (Ava — xAI Grok Voice Agent)
+# ---------------------------------------------------------------------------
+
+from receptionist import init_receptionist_table, store_message, notify_email  # noqa: E402
+
+init_receptionist_table()
+
+
+@app.route("/api/receptionist/message", methods=["POST"])
+def receptionist_message():
+    """Receive a take_message tool call from the Ava voice agent."""
+    token = request.headers.get("X-Receptionist-Token", "")
+    expected = os.environ.get("RECEPTIONIST_TOKEN", "")
+    if not expected or token != expected:
+        abort(401)
+    payload = request.get_json(silent=True) or {}
+    msg_id = store_message(payload)
+    notify_email(payload, msg_id)
+    return jsonify({"ok": True, "message_id": msg_id,
+                    "say": "Got it — I've passed your message along. Jay will get back to you shortly."})
+
+
+@app.route("/api/receptionist/messages")
+@require_auth
+def receptionist_messages():
+    """List recent receptionist messages (dashboard use)."""
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT * FROM receptionist_messages ORDER BY id DESC LIMIT 100"
+    ).fetchall()
+    conn.close()
+    return jsonify([dict(r) for r in rows])
+
+
 @app.route("/api/diagnostic")
 @require_auth
 def diagnostic():
