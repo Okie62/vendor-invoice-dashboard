@@ -1,6 +1,25 @@
 # Vendor Invoice Dashboard — Backlog
 
-*Generated: 2026-06-29*
+*Generated: 2026-06-29 · State refreshed: 2026-07-13*
+
+## 📌 Current State (2026-07-13)
+
+**Repository:** `main`, clean and synchronized through feature commit `28757c8` before this state update.
+
+**Live in production:**
+- Kyle.ai-style React/Vite/Tailwind dashboard with authentication and admin user management
+- A/P workflow (`received → needs_review → approved → scheduled → paid`), aging dashboard, vendor drill-down, and bulk status updates
+- Auth-gated PDF/HTML invoice viewer and processed-email log with parse-status filters
+- Gmail polling for PDF and HTML invoices, format recognition/review queue, duplicate-poller protection, relative document paths, migrations, health check, and automated receipt replies
+- Historical mailbox backfill completed: 184 emails processed, producing 194 invoice records across 49 vendors
+
+**Next work when resumed:**
+1. Rotate the exposed Gmail app password and update the Render `GMAIL_APP_PASSWORD` environment variable.
+2. Clean historical vendor attribution (forwarded messages assigned to the receipts mailbox; stray leading quotes in vendor names).
+3. Build parsers for the highest-volume unparsed formats: Google, Anthropic, Pronto Marketing, Slack, Textmagic, and Stripe.
+4. Triage/dismiss historical review-queue noise and correct old invoice payment statuses so outstanding A/P is meaningful.
+
+**Important:** The original backlog below is historical and substantially stale; many early security, reliability, UI, and test-suite items are already implemented. Verify each item against current code before starting it.
 
 ## 🔴 High Priority
 
