@@ -1,10 +1,10 @@
 # Vendor Invoice Dashboard — Backlog
 
-*Generated: 2026-06-29 · State refreshed: 2026-07-13*
+*Generated: 2026-06-29 · State refreshed: 2026-07-20*
 
-## 📌 Current State (2026-07-13)
+## 📌 Current State (2026-07-20)
 
-**Repository:** `main`, clean and synchronized through feature commit `28757c8` before this state update.
+**Repository:** Feature branch `fix/gmail-seen-lookback`, synchronized with GitHub through commit `fb77dd4` before this handoff update. Production remains on `main` at `ec4039d`; the Gmail lookback fix has not been merged or deployed.
 
 **Live in production:**
 - Kyle.ai-style React/Vite/Tailwind dashboard with authentication and admin user management
@@ -13,11 +13,39 @@
 - Gmail polling for PDF and HTML invoices, format recognition/review queue, duplicate-poller protection, relative document paths, migrations, health check, and automated receipt replies
 - Historical mailbox backfill completed: 184 emails processed, producing 194 invoice records across 49 vendors
 
-**Next work when resumed:**
-1. Rotate the exposed Gmail app password and update the Render `GMAIL_APP_PASSWORD` environment variable.
-2. Clean historical vendor attribution (forwarded messages assigned to the receipts mailbox; stray leading quotes in vendor names).
-3. Build parsers for the highest-volume unparsed formats: Google, Anthropic, Pronto Marketing, Slack, Textmagic, and Stripe.
-4. Triage/dismiss historical review-queue noise and correct old invoice payment statuses so outstanding A/P is meaningful.
+### Gmail ingestion incident and confirmed root cause
+
+- On 2026-07-20, an invoice reached the receipts mailbox but was already marked `Seen` before the production AP_Agent poller ran. Production searched only `UNSEEN`, so it skipped the invoice.
+- The competing consumer was confirmed as `Okie62/email-attachment-filer`, running on Jay's MacBook Air as launch agent `com.emailfiler` every 300 seconds.
+- Launchd showed 252 runs and a successful last exit (`0`). The legacy code searches `UNSEEN`, fetches full messages with IMAP `RFC822` (which changes shared read state), and explicitly applies `\\Seen` after processing.
+- The launch agent was unloaded on the MacBook Air and its plist renamed with a `.disabled` suffix. Verification with `launchctl print gui/$(id -u)/com.emailfiler` returned `Could not find service`, confirming it is no longer scheduled.
+- A synced Google Drive copy of the legacy filer still contains an app-password environment and Google OAuth credentials. Do not delete or revoke them until AP_Agent is verified in production and it is confirmed whether the old app password is shared with AP_Agent. Then retire the legacy credentials and remove sensitive credential files from the synced folder.
+
+### Fix ready on `fix/gmail-seen-lookback`
+
+- Poll a bounded seven-day Gmail window instead of treating the mutable `Seen` flag as a work queue.
+- Fetch with `BODY.PEEK[]` to avoid changing message read state during inspection.
+- Check the durable `processed_emails.message_id` ledger before ingestion and record completion only after successful processing.
+- Generate a stable SHA-256-derived identifier when an RFC Message-ID header is absent.
+- Preserve the existing `fetch_unseen_emails` entry point as a compatibility alias.
+- Added regression coverage for recent seen messages, PEEK fetching, fallback identifiers, and duplicate skipping.
+- Validation completed: 108 backend tests passed, Python compilation and diff checks passed, Gitleaks found no secrets, and a read-only real-mailbox check confirmed the previously missed PDF invoice is selected by the new lookback.
+
+### Resume/deployment checklist
+
+1. Review and approve `fix/gmail-seen-lookback`; fast-forward it to `main` only after approval. Render auto-deploys `main`.
+2. Monitor the Render deployment and poller logs without exposing message contents or credentials.
+3. Confirm the previously missed invoice is ingested exactly once, then send a fresh test invoice and verify it appears once in the dashboard.
+4. Confirm `com.emailfiler` remains absent on the MacBook Air after login/reboot.
+5. Determine whether the legacy Gmail app password is distinct from AP_Agent's Render credential. Rotate/revoke the legacy app password and OAuth token only after that check.
+6. Remove legacy credentials from the synchronized Google Drive folder and archive or delete the disabled launch-agent plist after the verification window.
+7. Continue the pre-existing data cleanup and parser backlog below.
+
+**Additional next work:**
+- Rotate any independently exposed AP_Agent Gmail credential and update Render safely.
+- Clean historical vendor attribution (forwarded messages assigned to the receipts mailbox; stray leading quotes in vendor names).
+- Build parsers for the highest-volume unparsed formats: Google, Anthropic, Pronto Marketing, Slack, Textmagic, and Stripe.
+- Triage/dismiss historical review-queue noise and correct old invoice payment statuses so outstanding A/P is meaningful.
 
 **Important:** The original backlog below is historical and substantially stale; many early security, reliability, UI, and test-suite items are already implemented. Verify each item against current code before starting it.
 
