@@ -1,7 +1,7 @@
 """
 Invoice ingestion pipeline.
 
-1. Poll Gmail for unseen emails with PDF attachments
+1. Poll a recent Gmail lookback window (Seen and Unseen)
 2. Extract vendor name from email metadata
 3. Parse PDF or HTML body to extract invoice data
 4. Store PDF/HTML to filesystem: data/invoices/{vendor}/{filename}
@@ -19,7 +19,7 @@ from typing import Optional
 
 from config import INVOICE_DIR
 from db import get_db, init_db
-from email_poller import connect_imap, fetch_unseen_emails, mark_seen
+from email_poller import connect_imap, fetch_recent_emails, mark_seen
 from email_sender import send_reply, extract_reply_address
 from pdf_parser import parse_pdf, ParsedInvoice
 from html_parser import parse_html_invoice
@@ -44,16 +44,19 @@ def run_ingestion():
         conn.close()
         return 0
 
-    emails = fetch_unseen_emails(imap)
+    emails = fetch_recent_emails(imap)
 
     if not emails:
-        log.info("No new emails with PDF attachments.")
+        log.info("No recent emails found.")
         imap.logout()
         conn.close()
         return 0
 
     processed = 0
     for email_data in emails:
+        if _is_message_processed(conn, email_data["message_id"]):
+            log.debug("Email %s already processed — skipping.", email_data["message_id"])
+            continue
         try:
             process_email(conn, email_data)
             mark_seen(imap, email_data["imap_id"])
@@ -66,6 +69,14 @@ def run_ingestion():
     conn.close()
     log.info(f"Processed {processed} email(s).")
     return processed
+
+
+def _is_message_processed(conn, message_id: str) -> bool:
+    """Use the durable Message-ID ledger as the polling idempotency boundary."""
+    return conn.execute(
+        "SELECT 1 FROM processed_emails WHERE message_id = ?",
+        (message_id,),
+    ).fetchone() is not None
 
 
 def process_email(conn, email_data: dict):

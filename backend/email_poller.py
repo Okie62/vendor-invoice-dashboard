@@ -2,7 +2,9 @@ from typing import Optional
 """
 IMAP inbox polling for vendor invoice emails.
 
-Polls a Gmail inbox for unseen emails — with or without PDF attachments.
+Polls a recent Gmail lookback window — with or without PDF attachments.
+Message-ID deduplication in the ingest layer prevents reprocessing. This avoids
+losing invoices when another Gmail client marks a message read first.
 HTML-only receipts are included so the ingest pipeline can parse them
 or store them as unparsed records (never silently dropped).
 
@@ -13,10 +15,12 @@ OAuth, confirmation flow, and reply sending.
 import email
 import email.header
 import email.utils
+import hashlib
 import imaplib
 import logging
 import re
 import time
+from datetime import datetime, timedelta, timezone
 
 from config import GMAIL_ADDRESS, GMAIL_APP_PASSWORD
 
@@ -53,9 +57,9 @@ def connect_imap(max_retries=3):
     )
 
 
-def fetch_unseen_emails(imap: imaplib.IMAP4_SSL) -> list:
+def fetch_recent_emails(imap: imaplib.IMAP4_SSL, lookback_days: int = 7) -> list:
     """
-    Fetch all UNSEEN emails.
+    Fetch messages received in a recent lookback window, regardless of Seen state.
 
     Returns list of dicts:
       {
@@ -67,18 +71,27 @@ def fetch_unseen_emails(imap: imaplib.IMAP4_SSL) -> list:
         "body_html":    "<raw HTML body (empty string if not HTML)>",
         "attachments":  [{"filename": "...", "bytes": b"..."}],  # may be empty
       }
-    Previously, emails without PDF attachments were silently skipped.
-    Now they are included so HTML-only receipts reach the ingest pipeline.
+    BODY.PEEK keeps unread messages unread until ingestion succeeds and explicitly
+    marks them Seen. The database's processed_emails Message-ID key provides the
+    idempotency boundary for messages returned on subsequent polls.
     """
+    if lookback_days < 1:
+        raise ValueError("lookback_days must be at least 1")
+
     imap.select("INBOX")
-    _, data = imap.search(None, "UNSEEN")
+    since = (datetime.now(timezone.utc) - timedelta(days=lookback_days)).strftime(
+        "%d-%b-%Y"
+    )
+    status, data = imap.search(None, "SINCE", since)
+    if status != "OK" or not data:
+        raise RuntimeError("IMAP recent-message search failed")
     ids = data[0].split()
     if not ids:
         return []
 
     results = []
     for imap_id in ids:
-        _, raw_data = imap.fetch(imap_id, "(RFC822)")
+        _, raw_data = imap.fetch(imap_id, "(BODY.PEEK[])")
         if not raw_data or raw_data[0] is None:
             continue
         raw_response = raw_data[0]
@@ -87,6 +100,9 @@ def fetch_unseen_emails(imap: imaplib.IMAP4_SSL) -> list:
 
         msg = email.message_from_bytes(raw_response[1])
         message_id = msg.get("Message-ID", "").strip()
+        if not message_id:
+            digest = hashlib.sha256(raw_response[1]).hexdigest()
+            message_id = f"<generated-{digest}@local>"
         subject = _decode_header(msg.get("Subject", ""))
         from_header = _decode_header(msg.get("From", ""))
         date_header = msg.get("Date", "")
@@ -110,9 +126,14 @@ def fetch_unseen_emails(imap: imaplib.IMAP4_SSL) -> list:
             "attachments": attachments,
         })
 
-    log.info("Fetched %d unseen email(s) (%d with PDF attachments)",
+    log.info("Fetched %d recent email(s) (%d with PDF attachments)",
              len(results), sum(1 for r in results if r["attachments"]))
     return results
+
+
+def fetch_unseen_emails(imap: imaplib.IMAP4_SSL) -> list:
+    """Backward-compatible alias for callers not yet migrated."""
+    return fetch_recent_emails(imap)
 
 
 def mark_seen(imap: imaplib.IMAP4_SSL, imap_id: bytes) -> None:
