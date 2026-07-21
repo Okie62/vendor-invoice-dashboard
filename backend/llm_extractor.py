@@ -21,12 +21,12 @@ log = logging.getLogger(__name__)
 XAI_API_URL = "https://api.x.ai/v1/chat/completions"
 DEFAULT_MODEL = "grok-4.5"
 FALLBACK_MODEL = "grok-2-1212"
+VISION_MODEL = "grok-2-vision-1212"
 REQUEST_TIMEOUT = 30.0
+VISION_TIMEOUT = 45.0
 
-SYSTEM_PROMPT = """\
-You are extracting structured data from a vendor invoice document \
-(PDF text or HTML). Return ONLY a JSON object with these exact keys \
-(use null for missing fields):
+# Shared JSON schema block used by full and selection-based prompts.
+_SCHEMA_BLOCK = """\
 {
   "invoice_id": "string or null",
   "billing_period": "string or null",
@@ -49,6 +49,27 @@ Rules:
 - customers and line_items may be empty arrays when not applicable.
 - Do not invent values that are not supported by the document text.
 """
+
+SYSTEM_PROMPT = f"""\
+You are extracting structured data from a vendor invoice document \
+(PDF text or HTML). Return ONLY a JSON object with these exact keys \
+(use null for missing fields):
+{_SCHEMA_BLOCK}"""
+
+SNIPPET_SYSTEM_PROMPT = (
+    "You are extracting structured data from a text snippet selected by a user "
+    "from a vendor invoice. Extract ONLY the fields you can identify from this "
+    "snippet. Return ONLY a JSON object with the same schema as full extraction. "
+    "Use null for fields you cannot determine from the snippet. Do not invent values.\n"
+    f"Schema (use null for missing fields):\n{_SCHEMA_BLOCK}"
+)
+
+VISION_USER_TEXT = f"""\
+Extract invoice fields from this image region (a cropped area of a vendor \
+invoice). Return ONLY a JSON object with these exact keys (use null for \
+missing fields). Extract ONLY what you can see in the image; do not invent \
+values.
+{_SCHEMA_BLOCK}"""
 
 
 class LLMExtractionError(Exception):
@@ -108,7 +129,22 @@ def _parse_json_content(content: str) -> dict[str, Any]:
     return data
 
 
-def _call_xai(messages: list[dict[str, str]], api_key: str, model: str) -> str:
+def _require_api_key() -> str:
+    """Return XAI_API_KEY or raise LLMNotConfiguredError."""
+    api_key = os.environ.get("XAI_API_KEY", "").strip()
+    if not api_key:
+        raise LLMNotConfiguredError(
+            "LLM extraction not configured — set XAI_API_KEY"
+        )
+    return api_key
+
+
+def _call_xai(
+    messages: list[dict[str, Any]],
+    api_key: str,
+    model: str,
+    timeout: float = REQUEST_TIMEOUT,
+) -> str:
     """POST to xAI chat completions and return message content text."""
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -120,10 +156,10 @@ def _call_xai(messages: list[dict[str, str]], api_key: str, model: str) -> str:
         "temperature": 0,
     }
     try:
-        with httpx.Client(timeout=REQUEST_TIMEOUT) as client:
+        with httpx.Client(timeout=timeout) as client:
             resp = client.post(XAI_API_URL, headers=headers, json=payload)
     except httpx.TimeoutException as e:
-        raise LLMExtractionError(f"xAI API timeout after {REQUEST_TIMEOUT}s") from e
+        raise LLMExtractionError(f"xAI API timeout after {timeout}s") from e
     except httpx.HTTPError as e:
         raise LLMExtractionError(f"xAI API request failed: {e}") from e
 
@@ -164,11 +200,7 @@ def extract_invoice_fields(raw_text: str, vendor_name: str = "") -> dict[str, An
         LLMNotConfiguredError: if XAI_API_KEY is unset.
         LLMExtractionError: if the API call or JSON parse fails.
     """
-    api_key = os.environ.get("XAI_API_KEY", "").strip()
-    if not api_key:
-        raise LLMNotConfiguredError(
-            "LLM extraction not configured — set XAI_API_KEY"
-        )
+    api_key = _require_api_key()
 
     if not (raw_text or "").strip():
         raise LLMExtractionError("No document text provided")
@@ -199,3 +231,118 @@ def extract_invoice_fields(raw_text: str, vendor_name: str = "") -> dict[str, An
             continue
 
     raise LLMExtractionError(str(last_error) if last_error else "LLM extraction failed")
+
+
+def extract_from_text_snippet(
+    snippet: str,
+    vendor_name: str = "",
+    existing_fields: dict | None = None,
+) -> dict[str, Any]:
+    """Extract invoice fields from a user-selected text snippet.
+
+    Uses a focused prompt that tells the LLM to extract only from the provided
+    snippet, not the full document. Returns a partial dict with whatever fields
+    it can find — may have fewer keys than the full extraction.
+    """
+    api_key = _require_api_key()
+
+    if not (snippet or "").strip():
+        raise LLMExtractionError("No text snippet provided")
+
+    vendor_hint = vendor_name.strip() if vendor_name else ""
+    user_parts = []
+    if vendor_hint:
+        user_parts.append(f"Vendor name (from our records): {vendor_hint}")
+    if existing_fields:
+        # Optional context only — model must still extract from the snippet.
+        user_parts.append(
+            "Existing fields already on the form (for context; do not copy "
+            "unless also present in the snippet):\n"
+            + json.dumps(existing_fields, default=str)
+        )
+    user_parts.append("Selected text snippet:")
+    user_parts.append(snippet)
+    user_message = "\n\n".join(user_parts)
+
+    messages = [
+        {"role": "system", "content": SNIPPET_SYSTEM_PROMPT},
+        {"role": "user", "content": user_message},
+    ]
+
+    last_error: Exception | None = None
+    for model in (DEFAULT_MODEL, FALLBACK_MODEL):
+        try:
+            content = _call_xai(messages, api_key, model)
+            return _parse_json_content(content)
+        except LLMExtractionError as e:
+            last_error = e
+            log.warning(
+                "Snippet extraction with model %s failed: %s", model, e
+            )
+            if model == FALLBACK_MODEL:
+                break
+            continue
+
+    raise LLMExtractionError(
+        str(last_error) if last_error else "Snippet extraction failed"
+    )
+
+
+def extract_from_image(
+    image_b64: str,
+    vendor_name: str = "",
+    mime_type: str = "image/png",
+) -> dict[str, Any]:
+    """Extract invoice fields from a cropped image region using xAI vision.
+
+    Sends the image to grok-2-vision-1212 with the same structured extraction
+    prompt. The image is sent as a base64 data URL in the message content.
+    """
+    api_key = _require_api_key()
+
+    if not (image_b64 or "").strip():
+        raise LLMExtractionError("No image data provided")
+
+    # Strip accidental data-URL prefix if the client included one
+    b64 = image_b64.strip()
+    if b64.startswith("data:") and "," in b64:
+        header, b64 = b64.split(",", 1)
+        if header.startswith("data:") and ";base64" in header:
+            mime_from_url = header[5:].split(";")[0]
+            if mime_from_url:
+                mime_type = mime_from_url
+
+    mime = (mime_type or "image/png").strip() or "image/png"
+    data_url = f"data:{mime};base64,{b64}"
+
+    vendor_hint = vendor_name.strip() if vendor_name else ""
+    text_parts = []
+    if vendor_hint:
+        text_parts.append(f"Vendor name (from our records): {vendor_hint}")
+    text_parts.append(VISION_USER_TEXT)
+    text_prompt = "\n\n".join(text_parts)
+
+    messages: list[dict[str, Any]] = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": text_prompt},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": data_url},
+                },
+            ],
+        }
+    ]
+
+    try:
+        content = _call_xai(
+            messages,
+            api_key,
+            VISION_MODEL,
+            timeout=VISION_TIMEOUT,
+        )
+        return _parse_json_content(content)
+    except LLMExtractionError as e:
+        log.warning("Vision extraction failed: %s", e)
+        raise

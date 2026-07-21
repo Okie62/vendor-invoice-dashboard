@@ -584,6 +584,205 @@ class TestReviewQueueAPI:
             args, kwargs = mock_extract.call_args
             assert vendor_name in (args[1] if len(args) > 1 else kwargs.get("vendor_name", ""))
 
+    def test_extract_selection_text(self, client, auth_headers, monkeypatch):
+        """Mocks extract_from_text_snippet and returns extracted_fields."""
+        from db import get_db
+        from format_recognition import create_review
+        from unittest.mock import patch
+
+        monkeypatch.setenv("XAI_API_KEY", "test-key-not-real")
+
+        sample_fields = {
+            "invoice_id": "INV-SEL-TEXT",
+            "billing_period": None,
+            "invoice_date": "2026-07-15",
+            "due_date": None,
+            "vendor_name": "SelText Vendor",
+            "previous_balance": None,
+            "credit_card_surcharges": None,
+            "payment_received": None,
+            "new_charges": 99.5,
+            "outstanding_balance": None,
+            "customers": [],
+            "line_items": [],
+        }
+
+        conn = get_db()
+        try:
+            suffix = "sel_text_xyz001"
+            vendor_name = f"SelTextVendor_{suffix}"
+            cursor = conn.execute(
+                "INSERT INTO vendors (name, email_domain) VALUES (?, ?)",
+                (vendor_name, f"stxt-{suffix}.com"),
+            )
+            vendor_id = cursor.lastrowid
+            inv_id = f"test_inv_sel_text_{suffix}"
+            conn.execute(
+                "INSERT INTO invoices (id, vendor_id, source, new_charges, outstanding_balance) "
+                "VALUES (?, ?, 'email_unparsed', 0, 0)",
+                (inv_id, vendor_id),
+            )
+            conn.commit()
+            rid = create_review(conn, inv_id, vendor_id, "no_parser")
+        finally:
+            conn.close()
+
+        with patch(
+            "server.extract_from_text_snippet",
+            return_value=sample_fields,
+        ) as mock_extract:
+            resp = client.post(
+                f"/api/reviews/{rid}/extract-selection",
+                headers=auth_headers,
+                json={"text": "Invoice #INV-SEL-TEXT Amount: $99.50"},
+            )
+            assert resp.status_code == 200
+            data = resp.get_json()
+            assert data["success"] is True
+            assert data["extracted_fields"]["invoice_id"] == "INV-SEL-TEXT"
+            assert data["extracted_fields"]["new_charges"] == 99.5
+            mock_extract.assert_called_once()
+            args, kwargs = mock_extract.call_args
+            assert "INV-SEL-TEXT" in args[0]
+            assert vendor_name in (
+                args[1] if len(args) > 1 else kwargs.get("vendor_name", "")
+            )
+
+    def test_extract_selection_image(self, client, auth_headers, monkeypatch):
+        """Mocks extract_from_image and returns extracted_fields."""
+        from db import get_db
+        from format_recognition import create_review
+        from unittest.mock import patch
+
+        monkeypatch.setenv("XAI_API_KEY", "test-key-not-real")
+
+        sample_fields = {
+            "invoice_id": "INV-SEL-IMG",
+            "billing_period": None,
+            "invoice_date": None,
+            "due_date": None,
+            "vendor_name": "SelImg Vendor",
+            "previous_balance": None,
+            "credit_card_surcharges": None,
+            "payment_received": None,
+            "new_charges": 42.0,
+            "outstanding_balance": 42.0,
+            "customers": [],
+            "line_items": [],
+        }
+
+        conn = get_db()
+        try:
+            suffix = "sel_img_xyz002"
+            vendor_name = f"SelImgVendor_{suffix}"
+            cursor = conn.execute(
+                "INSERT INTO vendors (name, email_domain) VALUES (?, ?)",
+                (vendor_name, f"simg-{suffix}.com"),
+            )
+            vendor_id = cursor.lastrowid
+            inv_id = f"test_inv_sel_img_{suffix}"
+            conn.execute(
+                "INSERT INTO invoices (id, vendor_id, source, new_charges, outstanding_balance) "
+                "VALUES (?, ?, 'email_unparsed', 0, 0)",
+                (inv_id, vendor_id),
+            )
+            conn.commit()
+            rid = create_review(conn, inv_id, vendor_id, "no_parser")
+        finally:
+            conn.close()
+
+        fake_b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+        with patch(
+            "server.extract_from_image",
+            return_value=sample_fields,
+        ) as mock_extract:
+            resp = client.post(
+                f"/api/reviews/{rid}/extract-selection",
+                headers=auth_headers,
+                json={"image": fake_b64, "mime_type": "image/png"},
+            )
+            assert resp.status_code == 200
+            data = resp.get_json()
+            assert data["success"] is True
+            assert data["extracted_fields"]["invoice_id"] == "INV-SEL-IMG"
+            assert data["extracted_fields"]["new_charges"] == 42.0
+            mock_extract.assert_called_once()
+            args, kwargs = mock_extract.call_args
+            assert args[0] == fake_b64
+            assert vendor_name in (
+                args[1] if len(args) > 1 else kwargs.get("vendor_name", "")
+            )
+
+    def test_extract_selection_no_body(self, client, auth_headers, monkeypatch):
+        """Returns 400 when neither text nor image is provided."""
+        from db import get_db
+        from format_recognition import create_review
+
+        monkeypatch.setenv("XAI_API_KEY", "test-key-not-real")
+
+        conn = get_db()
+        try:
+            suffix = "sel_nobody_xyz003"
+            cursor = conn.execute(
+                "INSERT INTO vendors (name, email_domain) VALUES (?, ?)",
+                (f"SelNoBody_{suffix}", f"snb-{suffix}.com"),
+            )
+            vendor_id = cursor.lastrowid
+            inv_id = f"test_inv_sel_nobody_{suffix}"
+            conn.execute(
+                "INSERT INTO invoices (id, vendor_id, source, new_charges, outstanding_balance) "
+                "VALUES (?, ?, 'email_unparsed', 0, 0)",
+                (inv_id, vendor_id),
+            )
+            conn.commit()
+            rid = create_review(conn, inv_id, vendor_id, "no_parser")
+        finally:
+            conn.close()
+
+        resp = client.post(
+            f"/api/reviews/{rid}/extract-selection",
+            headers=auth_headers,
+            json={},
+        )
+        assert resp.status_code == 400
+        data = resp.get_json()
+        assert "text or image" in data.get("error", "").lower()
+
+    def test_extract_selection_no_api_key(self, client, auth_headers, monkeypatch):
+        """Returns 503 when XAI_API_KEY is not set."""
+        from db import get_db
+        from format_recognition import create_review
+
+        monkeypatch.delenv("XAI_API_KEY", raising=False)
+
+        conn = get_db()
+        try:
+            suffix = "sel_nokey_xyz004"
+            cursor = conn.execute(
+                "INSERT INTO vendors (name, email_domain) VALUES (?, ?)",
+                (f"SelNoKey_{suffix}", f"snk-{suffix}.com"),
+            )
+            vendor_id = cursor.lastrowid
+            inv_id = f"test_inv_sel_nokey_{suffix}"
+            conn.execute(
+                "INSERT INTO invoices (id, vendor_id, source, new_charges, outstanding_balance) "
+                "VALUES (?, ?, 'email_unparsed', 0, 0)",
+                (inv_id, vendor_id),
+            )
+            conn.commit()
+            rid = create_review(conn, inv_id, vendor_id, "no_parser")
+        finally:
+            conn.close()
+
+        resp = client.post(
+            f"/api/reviews/{rid}/extract-selection",
+            headers=auth_headers,
+            json={"text": "some selected text"},
+        )
+        assert resp.status_code == 503
+        data = resp.get_json()
+        assert "XAI_API_KEY" in data.get("error", "")
+
     def test_list_formats(self, client, auth_headers):
         from db import get_db
         from format_recognition import compute_fingerprint, register_format

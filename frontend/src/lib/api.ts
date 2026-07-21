@@ -512,6 +512,18 @@ export async function autoExtractReview(id: number): Promise<AutoExtractResponse
   return data;
 }
 
+/** LLM extract from a user text/area selection on the review document. */
+export async function extractSelection(
+  reviewId: number,
+  body: { text?: string; image?: string; mime_type?: string },
+): Promise<AutoExtractResponse> {
+  const { data } = await api.post<AutoExtractResponse>(
+    `/api/reviews/${reviewId}/extract-selection`,
+    body,
+  );
+  return data;
+}
+
 export async function getFormats(): Promise<FormatRecord[]> {
   const { data } = await api.get<FormatRecord[]>('/api/formats');
   return data;

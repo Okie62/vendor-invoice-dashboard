@@ -26,7 +26,11 @@ from format_recognition import (
     get_review_list, get_review_by_id, extract_raw_text_from_document,
     create_review,
 )
-from llm_extractor import extract_invoice_fields
+from llm_extractor import (
+    extract_invoice_fields,
+    extract_from_text_snippet,
+    extract_from_image,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -1758,10 +1762,80 @@ def auto_extract_review(review_id):
     return jsonify({"success": True, "extracted_fields": fields})
 
 
-@app.route("/api/formats")
-@require_auth
-def list_formats():
-    """GET /api/formats — list registered formats per vendor."""
+@app.route("/api/reviews/<int:review_id>/extract-selection", methods=["POST"])
+@require_admin
+def extract_selection_review(review_id):
+    """POST /api/reviews/<id>/extract-selection — extract from a user selection.
+
+    Accepts either a text snippet OR a base64 image crop (not both). Uses
+    xAI text or vision models respectively. Does NOT mutate the invoice —
+    returns proposed fields for the admin to merge into the form.
+    """
+    import os as _os
+    if not (_os.environ.get("XAI_API_KEY") or "").strip():
+        return jsonify({
+            "error": "LLM extraction not configured — set XAI_API_KEY"
+        }), 503
+
+    conn = get_db()
+    review = get_review_by_id(conn, review_id)
+    conn.close()
+    if not review:
+        abort(404)
+
+    detail: dict = review  # type: ignore[assignment]
+    body = request.get_json(silent=True) or {}
+    text = body.get("text") if isinstance(body.get("text"), str) else ""
+    image = body.get("image") if isinstance(body.get("image"), str) else ""
+    mime_type = body.get("mime_type") or "image/png"
+    if not isinstance(mime_type, str):
+        mime_type = "image/png"
+
+    text = (text or "").strip()
+    image = (image or "").strip()
+    has_text = bool(text)
+    has_image = bool(image)
+
+    if has_text and has_image:
+        return jsonify({
+            "error": "Provide either text or image, not both"
+        }), 400
+    if not has_text and not has_image:
+        return jsonify({
+            "error": "Provide either text or image in the request body"
+        detail: dict = review  # type: ignore[assignment]
+        vendor_name = detail.get("vendor_name") or ""
+
+        try:
+            # Prefer image (area selection) when both are present; text path otherwise.
+            if image_b64:
+                fields = extract_from_image(
+                    image_b64,
+                    vendor_name=vendor_name,
+                    mime_type=mime_type,
+                )
+            else:
+                fields = extract_from_text_snippet(
+                    selected_text,
+                    vendor_name=vendor_name,
+                )
+        except Exception as e:
+            from llm_extractor import LLMNotConfiguredError
+            if isinstance(e, LLMNotConfiguredError):
+                return jsonify({
+                    "error": "LLM extraction not configured — set XAI_API_KEY"
+                }), 503
+            return jsonify({
+                "error": f"LLM extraction failed: {e}"
+            }), 502
+
+        return jsonify({"success": True, "extracted_fields": fields})
+
+
+        @app.route("/api/formats")
+        @require_auth
+        def list_formats():
+        """GET /api/formats — list registered formats per vendor."""
     conn = get_db()
     rows = conn.execute(
         "SELECT f.*, v.name as vendor_name "
