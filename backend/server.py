@@ -26,6 +26,7 @@ from format_recognition import (
     get_review_list, get_review_by_id, extract_raw_text_from_document,
     create_review,
 )
+from llm_extractor import extract_invoice_fields
 
 logging.basicConfig(
     level=logging.INFO,
@@ -1701,6 +1702,60 @@ def extract_and_verify(review_id):
     conn.close()
 
     return jsonify({"success": True, "invoice_id": invoice_id})
+
+
+@app.route("/api/reviews/<int:review_id>/auto-extract", methods=["POST"])
+@require_admin
+def auto_extract_review(review_id):
+    """POST /api/reviews/<id>/auto-extract — LLM-assisted field extraction.
+
+    Loads the linked document, extracts raw text, and asks xAI Grok for
+    structured invoice fields. Does NOT apply changes to the invoice —
+    returns the proposed fields for admin review.
+    """
+    import os as _os
+    if not (_os.environ.get("XAI_API_KEY") or "").strip():
+        return jsonify({
+            "error": "LLM extraction not configured — set XAI_API_KEY"
+        }), 503
+
+    conn = get_db()
+    review = get_review_by_id(conn, review_id)
+    conn.close()
+    if not review:
+        abort(404)
+
+    detail: dict = review  # type: ignore[assignment]
+    stored_path = detail.get("pdf_path") or ""
+    resolved = _resolve_pdf_path(stored_path) if stored_path else None
+    raw_text = ""
+    if resolved is not None:
+        raw_text = extract_raw_text_from_document(str(resolved))
+    elif stored_path:
+        # Fall back to whatever extract_raw_text can do with the stored key
+        raw_text = extract_raw_text_from_document(stored_path)
+
+    if not (raw_text or "").strip():
+        return jsonify({
+            "error": "No document text found to extract from"
+        }), 400
+
+    vendor_name = detail.get("vendor_name") or ""
+    try:
+        fields = extract_invoice_fields(raw_text, vendor_name)
+    except Exception as e:
+        # LLMNotConfiguredError should be rare here (checked above) but
+        # map it cleanly; other failures become 502.
+        from llm_extractor import LLMNotConfiguredError
+        if isinstance(e, LLMNotConfiguredError):
+            return jsonify({
+                "error": "LLM extraction not configured — set XAI_API_KEY"
+            }), 503
+        return jsonify({
+            "error": f"LLM extraction failed: {e}"
+        }), 502
+
+    return jsonify({"success": True, "extracted_fields": fields})
 
 
 @app.route("/api/formats")

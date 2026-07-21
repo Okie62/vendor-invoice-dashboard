@@ -439,6 +439,151 @@ class TestReviewQueueAPI:
         assert new is not None
         conn.close()
 
+    def test_auto_extract_no_api_key(self, client, auth_headers, monkeypatch):
+        """Returns 503 when XAI_API_KEY is not set."""
+        from db import get_db
+        from format_recognition import create_review
+
+        monkeypatch.delenv("XAI_API_KEY", raising=False)
+
+        conn = get_db()
+        try:
+            suffix = "autoext_no_key_xyz"
+            cursor = conn.execute(
+                "INSERT INTO vendors (name, email_domain) VALUES (?, ?)",
+                (f"AutoExtVendor_{suffix}", f"aek-{suffix}.com"),
+            )
+            vendor_id = cursor.lastrowid
+            inv_id = f"test_inv_autoext_nokey_{suffix}"
+            conn.execute(
+                "INSERT INTO invoices (id, vendor_id, source, new_charges, outstanding_balance) "
+                "VALUES (?, ?, 'email_unparsed', 0, 0)",
+                (inv_id, vendor_id),
+            )
+            conn.commit()
+            rid = create_review(conn, inv_id, vendor_id, "no_parser")
+        finally:
+            conn.close()
+
+        resp = client.post(
+            f"/api/reviews/{rid}/auto-extract",
+            headers=auth_headers,
+        )
+        assert resp.status_code == 503
+        data = resp.get_json()
+        assert "XAI_API_KEY" in data.get("error", "")
+
+    def test_auto_extract_no_document_text(self, client, auth_headers, monkeypatch):
+        """Returns 400 when review has no usable document text (no pdf_path)."""
+        from db import get_db
+        from format_recognition import create_review
+
+        # Key must be set so we don't short-circuit on 503
+        monkeypatch.setenv("XAI_API_KEY", "test-key-not-real")
+
+        conn = get_db()
+        try:
+            suffix = "autoext_nodoc_xyz"
+            cursor = conn.execute(
+                "INSERT INTO vendors (name, email_domain) VALUES (?, ?)",
+                (f"AutoExtNoDoc_{suffix}", f"aend-{suffix}.com"),
+            )
+            vendor_id = cursor.lastrowid
+            inv_id = f"test_inv_autoext_nodoc_{suffix}"
+            # No pdf_path — extract_raw_text has nothing to read
+            conn.execute(
+                "INSERT INTO invoices (id, vendor_id, source, new_charges, outstanding_balance) "
+                "VALUES (?, ?, 'email_unparsed', 0, 0)",
+                (inv_id, vendor_id),
+            )
+            conn.commit()
+            rid = create_review(conn, inv_id, vendor_id, "no_parser")
+        finally:
+            conn.close()
+
+        resp = client.post(
+            f"/api/reviews/{rid}/auto-extract",
+            headers=auth_headers,
+        )
+        assert resp.status_code == 400
+        data = resp.get_json()
+        assert "No document text" in data.get("error", "")
+
+    def test_auto_extract_success(self, client, auth_headers, monkeypatch):
+        """Mocks llm_extractor and returns extracted_fields on success."""
+        from db import get_db
+        from format_recognition import create_review
+        from unittest.mock import patch
+        import pathlib
+        import config as cfg
+
+        monkeypatch.setenv("XAI_API_KEY", "test-key-not-real")
+
+        sample_fields = {
+            "invoice_id": "INV-9001",
+            "billing_period": "Jul 2026",
+            "invoice_date": "2026-07-01",
+            "due_date": "2026-07-31",
+            "vendor_name": "AutoExt Success Vendor",
+            "previous_balance": 0,
+            "credit_card_surcharges": 0,
+            "payment_received": 0,
+            "new_charges": 250.0,
+            "outstanding_balance": 250.0,
+            "customers": [],
+            "line_items": [],
+        }
+
+        conn = get_db()
+        try:
+            suffix = "autoext_ok_xyz789"
+            vendor_name = f"AutoExtOK_{suffix}"
+            cursor = conn.execute(
+                "INSERT INTO vendors (name, email_domain) VALUES (?, ?)",
+                (vendor_name, f"aeok-{suffix}.com"),
+            )
+            vendor_id = cursor.lastrowid
+            inv_id = f"test_inv_autoext_ok_{suffix}"
+
+            # Write a tiny text document so raw_text is non-empty
+            inv_dir = pathlib.Path(cfg.DATA_DIR) / "invoices" / vendor_name
+            inv_dir.mkdir(parents=True, exist_ok=True)
+            doc_path = inv_dir / "sample.txt"
+            doc_path.write_text(
+                "Invoice INV-9001\nAmount due: $250.00\n",
+                encoding="utf-8",
+            )
+            rel_path = str(doc_path.relative_to(cfg.DATA_DIR))
+
+            conn.execute(
+                "INSERT INTO invoices "
+                "(id, vendor_id, source, new_charges, outstanding_balance, pdf_path) "
+                "VALUES (?, ?, 'email_unparsed', 0, 0, ?)",
+                (inv_id, vendor_id, rel_path),
+            )
+            conn.commit()
+            rid = create_review(conn, inv_id, vendor_id, "no_parser")
+        finally:
+            conn.close()
+
+        with patch(
+            "server.extract_invoice_fields",
+            return_value=sample_fields,
+        ) as mock_extract:
+            resp = client.post(
+                f"/api/reviews/{rid}/auto-extract",
+                headers=auth_headers,
+            )
+            assert resp.status_code == 200
+            data = resp.get_json()
+            assert data["success"] is True
+            assert data["extracted_fields"]["invoice_id"] == "INV-9001"
+            assert data["extracted_fields"]["new_charges"] == 250.0
+            mock_extract.assert_called_once()
+            # vendor_name from review should be passed through
+            args, kwargs = mock_extract.call_args
+            assert vendor_name in (args[1] if len(args) > 1 else kwargs.get("vendor_name", ""))
+
     def test_list_formats(self, client, auth_headers):
         from db import get_db
         from format_recognition import compute_fingerprint, register_format
