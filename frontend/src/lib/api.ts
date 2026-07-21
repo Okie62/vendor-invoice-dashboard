@@ -168,14 +168,50 @@ export interface AdminUser {
 }
 
 export interface ReviewItem {
-  id: string;
+  id: number;
   invoice_id: string;
-  vendor: string;
+  vendor_id: number;
+  vendor_name: string;
+  detected_at: string;
   status: string;
-  extracted_text: string;
-  confidence: number;
-  parsed_data: Record<string, unknown>;
-  created_at: string;
+  detection_reason: string;
+  extracted_data: Record<string, unknown> | null;
+  notes: string | null;
+  reviewed_by: number | null;
+  reviewed_at: string | null;
+  invoice_source: string | null;
+  pdf_path: string | null;
+  email_message_id: string | null;
+}
+
+export interface ReviewDetail {
+  review: ReviewItem;
+  raw_text: string;
+}
+
+export interface ExtractedFields {
+  invoice_id: string | null;
+  billing_period: string | null;
+  invoice_date: string | null;
+  due_date: string | null;
+  vendor_name: string | null;
+  previous_balance: number | null;
+  credit_card_surcharges: number | null;
+  payment_received: number | null;
+  new_charges: number | null;
+  outstanding_balance: number | null;
+  customers: { name: string; account_id: string; partner_id: string; total: number }[];
+  line_items: { customer: string; date: string; item: string; type: string; qty: number; unit_price: number; amount: number }[];
+}
+
+export interface AutoExtractResponse {
+  success: boolean;
+  extracted_fields: ExtractedFields;
+}
+
+export interface ExtractReviewResponse {
+  success: boolean;
+  invoice_id: string;
 }
 
 export interface DashboardData {
@@ -448,18 +484,31 @@ export async function getReviews(status = 'pending'): Promise<ReviewItem[]> {
   return data;
 }
 
-export async function getReview(id: string): Promise<ReviewItem> {
-  const { data } = await api.get<ReviewItem>(`/api/reviews/${id}`);
+export async function getReview(id: number): Promise<ReviewDetail> {
+  const { data } = await api.get<ReviewDetail>(`/api/reviews/${id}`);
   return data;
 }
 
-export async function patchReview(id: string, body: Partial<ReviewItem>): Promise<ReviewItem> {
-  const { data } = await api.patch<ReviewItem>(`/api/reviews/${id}`, body);
+export async function patchReview(
+  id: number,
+  body: { status?: string; notes?: string },
+): Promise<{ success: boolean }> {
+  const { data } = await api.patch<{ success: boolean }>(`/api/reviews/${id}`, body);
   return data;
 }
 
-export async function extractReview(id: string, field_overrides: Record<string, unknown> = {}): Promise<ReviewItem> {
-  const { data } = await api.post<ReviewItem>(`/api/reviews/${id}/extract`, { field_overrides });
+export async function extractReview(
+  id: number,
+  field_overrides: Record<string, unknown> = {},
+): Promise<ExtractReviewResponse> {
+  const { data } = await api.post<ExtractReviewResponse>(`/api/reviews/${id}/extract`, {
+    field_overrides,
+  });
+  return data;
+}
+
+export async function autoExtractReview(id: number): Promise<AutoExtractResponse> {
+  const { data } = await api.post<AutoExtractResponse>(`/api/reviews/${id}/auto-extract`);
   return data;
 }
 
