@@ -13,12 +13,14 @@ import {
   ChevronUp,
 } from 'lucide-react';
 import { useAuth } from '../../hooks/useAuth';
+import PdfReviewViewer from '../../components/PdfReviewViewer';
 import {
   getReviews,
   getReview,
   getFormats,
   autoExtractReview,
   extractReview,
+  extractSelection,
   patchReview,
   type ReviewItem,
   type ExtractedFields,
@@ -99,6 +101,42 @@ function fieldsToForm(fields: ExtractedFields | null | undefined): FormState {
   };
 }
 
+/** Merge non-null extracted fields into existing form; return list of updated keys. */
+function mergeFieldsIntoForm(
+  prev: FormState,
+  fields: ExtractedFields,
+): { next: FormState; updated: string[] } {
+  const next = { ...prev };
+  const updated: string[] = [];
+  const num = (v: number | null | undefined) =>
+    v === null || v === undefined || Number.isNaN(v) ? null : String(v);
+
+  const setStr = (key: keyof FormState, val: string | null | undefined) => {
+    if (val === null || val === undefined || val === '') return;
+    next[key] = val;
+    updated.push(key);
+  };
+  const setNum = (key: keyof FormState, val: number | null | undefined) => {
+    const s = num(val);
+    if (s === null) return;
+    next[key] = s;
+    updated.push(key);
+  };
+
+  setStr('invoice_id', fields.invoice_id);
+  setStr('billing_period', fields.billing_period);
+  setStr('invoice_date', fields.invoice_date);
+  setStr('due_date', fields.due_date);
+  setStr('vendor_name', fields.vendor_name);
+  setNum('previous_balance', fields.previous_balance);
+  setNum('credit_card_surcharges', fields.credit_card_surcharges);
+  setNum('payment_received', fields.payment_received);
+  setNum('new_charges', fields.new_charges);
+  setNum('outstanding_balance', fields.outstanding_balance);
+
+  return { next, updated };
+}
+
 function formToOverrides(form: FormState): Record<string, unknown> {
   const parseNum = (s: string): number | null => {
     const t = s.trim();
@@ -143,7 +181,6 @@ function axiosMessage(err: unknown, fallback: string): string {
 function fmtTimestamp(s: string | null | undefined): string {
   if (!s) return '—';
   try {
-    // Backend may return "YYYY-MM-DD HH:MM:SS" without timezone
     const d = new Date(s.includes('T') ? s : s.replace(' ', 'T') + 'Z');
     if (Number.isNaN(d.getTime())) return s;
     return d.toLocaleString('en-US', {
@@ -192,6 +229,7 @@ export default function Reviews() {
   const [lineItems, setLineItems] = useState<ExtractedFields['line_items']>([]);
   const [actionError, setActionError] = useState<string | null>(null);
   const [successMsg, setSuccessMsg] = useState<string | null>(null);
+  const [rawSelectedText, setRawSelectedText] = useState('');
 
   const {
     data: reviews = [],
@@ -229,6 +267,7 @@ export default function Reviews() {
     setLineItems([]);
     setActionError(null);
     setSuccessMsg(null);
+    setRawSelectedText('');
   }, [selectedId]);
 
   const invalidateReviews = () => {
@@ -238,16 +277,39 @@ export default function Reviews() {
     }
   };
 
-  const autoExtractMutation = useMutation({
-    mutationFn: (id: number) => autoExtractReview(id),
-    onSuccess: (data) => {
-      setActionError(null);
-      const fields = data.extracted_fields;
+  const applyExtraction = (fields: ExtractedFields, mode: 'replace' | 'merge') => {
+    if (mode === 'replace') {
       setForm(fieldsToForm(fields));
       setCustomers(fields.customers || []);
       setLineItems(fields.line_items || []);
       setHasExtracted(true);
       setSuccessMsg('Fields extracted — review and edit before verifying.');
+      return;
+    }
+
+    const { next, updated } = mergeFieldsIntoForm(form, fields);
+    setForm(next);
+    if (fields.customers?.length) {
+      setCustomers(fields.customers);
+      if (!updated.includes('customers')) updated.push('customers');
+    }
+    if (fields.line_items?.length) {
+      setLineItems(fields.line_items);
+      if (!updated.includes('line_items')) updated.push('line_items');
+    }
+    setHasExtracted(true);
+    if (updated.length) {
+      setSuccessMsg(`Added: ${updated.join(', ')}`);
+    } else {
+      setSuccessMsg('No new fields found in selection.');
+    }
+  };
+
+  const autoExtractMutation = useMutation({
+    mutationFn: (id: number) => autoExtractReview(id),
+    onSuccess: (data) => {
+      setActionError(null);
+      applyExtraction(data.extracted_fields, 'replace');
     },
     onError: (err) => {
       setSuccessMsg(null);
@@ -255,14 +317,31 @@ export default function Reviews() {
     },
   });
 
+  const selectionMutation = useMutation({
+    mutationFn: (args: { id: number; body: { text?: string; image?: string; mime_type?: string } }) =>
+      extractSelection(args.id, args.body),
+    onSuccess: (data) => {
+      setActionError(null);
+      applyExtraction(data.extracted_fields, 'merge');
+      setRawSelectedText('');
+      try {
+        window.getSelection()?.removeAllRanges();
+      } catch {
+        /* ignore */
+      }
+    },
+    onError: (err) => {
+      setSuccessMsg(null);
+      setActionError(axiosMessage(err, 'Selection extract failed.'));
+    },
+  });
+
   const verifyMutation = useMutation({
     mutationFn: async (id: number) => {
       const overrides = formToOverrides(form);
-      // Include customers/line_items if we have them from auto-extract
       if (customers.length) overrides.customers = customers;
       if (lineItems.length) overrides.line_items = lineItems;
       const result = await extractReview(id, overrides);
-      // extract endpoint already sets verified; patch also for explicit status/notes sync
       try {
         await patchReview(id, { status: 'verified' });
       } catch {
@@ -331,6 +410,45 @@ export default function Reviews() {
 
   const labelStyle = { color: 'var(--th-text-tertiary)' } as const;
 
+  const handleTextSelected = (text: string) => {
+    if (!isAdmin || selectedId === null || !text.trim()) return;
+    setActionError(null);
+    setSuccessMsg(null);
+    selectionMutation.mutate({ id: selectedId, body: { text: text.trim() } });
+  };
+
+  const handleAreaSelected = (base64Png: string) => {
+    if (!isAdmin || selectedId === null || !base64Png.trim()) return;
+    setActionError(null);
+    setSuccessMsg(null);
+    selectionMutation.mutate({
+      id: selectedId,
+      body: { image: base64Png.trim(), mime_type: 'image/png' },
+    });
+  };
+
+  const handleRawTextExtract = () => {
+    const text = rawSelectedText.trim() || (typeof window !== 'undefined' ? window.getSelection()?.toString().trim() : '') || '';
+    if (!text) {
+      setActionError('Select some raw text first, then click Extract Selection.');
+      return;
+    }
+    handleTextSelected(text);
+  };
+
+  const fieldLabels: [keyof FormState, string][] = [
+    ['invoice_id', 'Invoice ID'],
+    ['billing_period', 'Billing period'],
+    ['invoice_date', 'Invoice date'],
+    ['due_date', 'Due date'],
+    ['vendor_name', 'Vendor name'],
+    ['previous_balance', 'Previous balance'],
+    ['credit_card_surcharges', 'CC surcharges'],
+    ['payment_received', 'Payment received'],
+    ['new_charges', 'New charges'],
+    ['outstanding_balance', 'Outstanding balance'],
+  ];
+
   return (
     <div className="min-h-full p-3 sm:p-6" style={{ backgroundColor: 'var(--th-surface-1)' }}>
       <div className="mb-2 flex items-center gap-2">
@@ -340,7 +458,7 @@ export default function Reviews() {
         </h1>
       </div>
       <p className="mb-5 text-sm" style={{ color: 'var(--th-text-tertiary)' }}>
-        Review unrecognized invoice formats. Auto-extract fields with LLM, edit, then verify.
+        Review unrecognized invoice formats. Select text or areas on the document, extract fields, edit, then verify.
       </p>
 
       {listErrorMsg && (
@@ -430,6 +548,7 @@ export default function Reviews() {
               label: r.detection_reason || 'unknown',
             };
             const st = STATUS_BADGE[r.status] || STATUS_BADGE.pending;
+            const pdfPath = detail?.review?.pdf_path ?? r.pdf_path;
 
             return (
               <div
@@ -473,7 +592,7 @@ export default function Reviews() {
 
                 {expanded && (
                   <div className="px-4 pb-4 pt-0" style={{ borderTop: '1px solid var(--th-border)' }}>
-                    <div className="pt-3 space-y-4">
+                    <div className="pt-3 space-y-3">
                       {actionError && (
                         <div
                           className="p-3 rounded-lg text-sm flex items-start gap-2"
@@ -502,199 +621,302 @@ export default function Reviews() {
                         </div>
                       )}
 
-                      {/* Meta */}
                       {r.notes && (
                         <p className="text-xs" style={{ color: 'var(--th-text-secondary)' }}>
                           Notes: {r.notes}
                         </p>
                       )}
-                      {r.extracted_data && (
-                        <div>
-                          <h4
-                            className="text-xs font-semibold uppercase tracking-wider mb-1.5"
-                            style={{ color: 'var(--th-text-tertiary)' }}
-                          >
-                            Detection data
-                          </h4>
-                          <pre
-                            className="p-3 rounded-lg font-mono text-xs whitespace-pre-wrap max-h-[120px] overflow-auto"
-                            style={{
-                              backgroundColor: 'var(--th-surface-2)',
-                              color: 'var(--th-text-secondary)',
-                              border: '1px solid var(--th-border)',
-                            }}
-                          >
-                            {JSON.stringify(r.extracted_data, null, 2)}
-                          </pre>
-                        </div>
-                      )}
 
-                      {/* Raw text */}
-                      <div>
-                        <h4
-                          className="text-xs font-semibold uppercase tracking-wider mb-1.5"
-                          style={{ color: 'var(--th-text-tertiary)' }}
+                      {/* Split view: document | fields */}
+                      <div className="grid grid-cols-1 lg:grid-cols-2 gap-3 min-h-[420px]">
+                        {/* LEFT: Document */}
+                        <div
+                          className="flex flex-col min-h-[360px] max-h-[70vh] overflow-hidden rounded-lg"
+                          style={{ border: '1px solid var(--th-border)', backgroundColor: 'var(--th-surface-0)' }}
                         >
-                          Raw document text
-                        </h4>
-                        {detailLoading && (
                           <div
-                            className="flex items-center gap-2 text-xs py-4"
-                            style={{ color: 'var(--th-text-tertiary)' }}
-                          >
-                            <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                            Loading document text…
-                          </div>
-                        )}
-                        {isDetailError && (
-                          <p className="text-xs" style={{ color: 'var(--th-danger)' }}>
-                            {axiosMessage(detailError, 'Could not load review detail.')}
-                          </p>
-                        )}
-                        {!detailLoading && detail && (
-                          <pre
-                            className="p-3 rounded-lg font-mono text-xs whitespace-pre-wrap max-h-[300px] overflow-auto"
+                            className="px-3 py-2 text-xs font-semibold uppercase tracking-wider"
                             style={{
-                              backgroundColor: 'var(--th-surface-2)',
-                              color: 'var(--th-text-secondary)',
-                              border: '1px solid var(--th-border)',
+                              color: 'var(--th-text-tertiary)',
+                              borderBottom: '1px solid var(--th-border)',
+                              backgroundColor: 'var(--th-surface-1)',
                             }}
                           >
-                            {detail.raw_text?.trim()
-                              ? detail.raw_text
-                              : '(No text extracted from document)'}
-                          </pre>
-                        )}
-                      </div>
-
-                      {/* Extracted fields form */}
-                      {hasExtracted && (
-                        <div>
-                          <h4
-                            className="text-xs font-semibold uppercase tracking-wider mb-2"
-                            style={{ color: 'var(--th-text-tertiary)' }}
-                          >
-                            Extracted fields (editable)
-                          </h4>
-                          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
-                            {(
-                              [
-                                ['invoice_id', 'Invoice ID'],
-                                ['billing_period', 'Billing period'],
-                                ['invoice_date', 'Invoice date'],
-                                ['due_date', 'Due date'],
-                                ['vendor_name', 'Vendor name'],
-                                ['previous_balance', 'Previous balance'],
-                                ['credit_card_surcharges', 'CC surcharges'],
-                                ['payment_received', 'Payment received'],
-                                ['new_charges', 'New charges'],
-                                ['outstanding_balance', 'Outstanding balance'],
-                              ] as const
-                            ).map(([key, label]) => (
-                              <div key={key}>
-                                <label className="block text-[11px] uppercase tracking-wider mb-1" style={labelStyle}>
-                                  {label}
-                                </label>
-                                <input
-                                  value={form[key]}
-                                  onChange={(e) => updateField(key, e.target.value)}
-                                  className="w-full px-2.5 py-2 text-sm rounded-comfortable focus:outline-none"
-                                  style={inputStyle}
-                                />
-                              </div>
-                            ))}
+                            Document
                           </div>
+                          <div className="flex-1 min-h-0 overflow-auto p-2">
+                            {detailLoading && (
+                              <div
+                                className="flex items-center gap-2 text-xs py-8 justify-center"
+                                style={{ color: 'var(--th-text-tertiary)' }}
+                              >
+                                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                                Loading document…
+                              </div>
+                            )}
+                            {isDetailError && (
+                              <p className="text-xs p-3" style={{ color: 'var(--th-danger)' }}>
+                                {axiosMessage(detailError, 'Could not load review detail.')}
+                              </p>
+                            )}
+                            {!detailLoading && (
+                              <>
+                                {pdfPath ? (
+                                  <div className="h-full min-h-[320px]">
+                                    <PdfReviewViewer
+                                      invoiceId={r.invoice_id}
+                                      pdfPath={pdfPath}
+                                      onTextSelected={isAdmin ? handleTextSelected : undefined}
+                                      onAreaSelected={isAdmin ? handleAreaSelected : undefined}
+                                      extracting={selectionMutation.isPending}
+                                    />
+                                  </div>
+                                ) : (
+                                  <div className="space-y-2">
+                                    <p className="text-xs" style={{ color: 'var(--th-text-tertiary)' }}>
+                                      No file on disk — select from raw text below.
+                                    </p>
+                                    <pre
+                                      className="p-3 rounded-lg font-mono text-xs whitespace-pre-wrap max-h-[360px] overflow-auto select-text"
+                                      style={{
+                                        backgroundColor: 'var(--th-surface-2)',
+                                        color: 'var(--th-text-secondary)',
+                                        border: '1px solid var(--th-border)',
+                                      }}
+                                      onMouseUp={() => {
+                                        const t = window.getSelection()?.toString().trim() || '';
+                                        setRawSelectedText(t);
+                                      }}
+                                    >
+                                      {detail?.raw_text?.trim()
+                                        ? detail.raw_text
+                                        : '(No text extracted from document)'}
+                                    </pre>
+                                    {isAdmin && (
+                                      <button
+                                        type="button"
+                                        disabled={selectionMutation.isPending || !rawSelectedText}
+                                        onClick={handleRawTextExtract}
+                                        className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-white rounded-comfortable disabled:opacity-50"
+                                        style={{ backgroundColor: 'var(--color-brand)' }}
+                                      >
+                                        {selectionMutation.isPending ? (
+                                          <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                                        ) : (
+                                          <Sparkles className="h-3.5 w-3.5" />
+                                        )}
+                                        Extract Selection
+                                      </button>
+                                    )}
+                                  </div>
+                                )}
 
-                          {(customers.length > 0 || lineItems.length > 0) && (
-                            <div className="mt-3 grid grid-cols-1 lg:grid-cols-2 gap-3">
-                              {customers.length > 0 && (
-                                <div>
-                                  <h5
-                                    className="text-[11px] uppercase tracking-wider mb-1"
-                                    style={labelStyle}
-                                  >
-                                    Customers ({customers.length})
-                                  </h5>
-                                  <pre
-                                    className="p-2 rounded-lg font-mono text-[11px] whitespace-pre-wrap max-h-[140px] overflow-auto"
-                                    style={{
-                                      backgroundColor: 'var(--th-surface-2)',
-                                      color: 'var(--th-text-secondary)',
-                                      border: '1px solid var(--th-border)',
-                                    }}
-                                  >
-                                    {JSON.stringify(customers, null, 2)}
-                                  </pre>
-                                </div>
+                                {/* Always offer collapsible raw text under PDF when available */}
+                                {pdfPath && detail?.raw_text?.trim() && (
+                                  <details className="mt-2">
+                                    <summary
+                                      className="text-[11px] cursor-pointer uppercase tracking-wider"
+                                      style={{ color: 'var(--th-text-quaternary)' }}
+                                    >
+                                      Raw text fallback
+                                    </summary>
+                                    <div className="mt-1 space-y-2">
+                                      <pre
+                                        className="p-2 rounded-lg font-mono text-[11px] whitespace-pre-wrap max-h-[160px] overflow-auto select-text"
+                                        style={{
+                                          backgroundColor: 'var(--th-surface-2)',
+                                          color: 'var(--th-text-secondary)',
+                                          border: '1px solid var(--th-border)',
+                                        }}
+                                        onMouseUp={() => {
+                                          const t = window.getSelection()?.toString().trim() || '';
+                                          setRawSelectedText(t);
+                                        }}
+                                      >
+                                        {detail.raw_text}
+                                      </pre>
+                                      {isAdmin && rawSelectedText && (
+                                        <button
+                                          type="button"
+                                          disabled={selectionMutation.isPending}
+                                          onClick={handleRawTextExtract}
+                                          className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-semibold text-white rounded disabled:opacity-50"
+                                          style={{ backgroundColor: 'var(--color-brand)' }}
+                                        >
+                                          {selectionMutation.isPending ? (
+                                            <Loader2 className="h-3 w-3 animate-spin" />
+                                          ) : (
+                                            <Sparkles className="h-3 w-3" />
+                                          )}
+                                          Extract Selection
+                                        </button>
+                                      )}
+                                    </div>
+                                  </details>
+                                )}
+                              </>
+                            )}
+                          </div>
+                        </div>
+
+                        {/* RIGHT: Extracted fields */}
+                        <div
+                          className="flex flex-col min-h-[360px] max-h-[70vh] overflow-hidden rounded-lg"
+                          style={{ border: '1px solid var(--th-border)', backgroundColor: 'var(--th-surface-0)' }}
+                        >
+                          <div
+                            className="flex flex-wrap items-center justify-between gap-2 px-3 py-2"
+                            style={{
+                              borderBottom: '1px solid var(--th-border)',
+                              backgroundColor: 'var(--th-surface-1)',
+                            }}
+                          >
+                            <span
+                              className="text-xs font-semibold uppercase tracking-wider"
+                              style={{ color: 'var(--th-text-tertiary)' }}
+                            >
+                              Extracted fields
+                            </span>
+                            <div className="flex flex-wrap gap-1.5">
+                              {isAdmin && (
+                                <button
+                                  type="button"
+                                  disabled={autoExtractMutation.isPending || selectedId === null}
+                                  onClick={() => {
+                                    setActionError(null);
+                                    setSuccessMsg(null);
+                                    if (selectedId !== null) autoExtractMutation.mutate(selectedId);
+                                  }}
+                                  className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-semibold text-white rounded disabled:opacity-50"
+                                  style={{ backgroundColor: 'var(--color-brand)' }}
+                                >
+                                  {autoExtractMutation.isPending ? (
+                                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                                  ) : (
+                                    <Sparkles className="h-3.5 w-3.5" />
+                                  )}
+                                  {autoExtractMutation.isPending ? 'Extracting…' : 'Auto-Extract'}
+                                </button>
                               )}
-                              {lineItems.length > 0 && (
-                                <div>
-                                  <h5
-                                    className="text-[11px] uppercase tracking-wider mb-1"
-                                    style={labelStyle}
-                                  >
-                                    Line items ({lineItems.length})
-                                  </h5>
-                                  <pre
-                                    className="p-2 rounded-lg font-mono text-[11px] whitespace-pre-wrap max-h-[140px] overflow-auto"
-                                    style={{
-                                      backgroundColor: 'var(--th-surface-2)',
-                                      color: 'var(--th-text-secondary)',
-                                      border: '1px solid var(--th-border)',
-                                    }}
-                                  >
-                                    {JSON.stringify(lineItems, null, 2)}
-                                  </pre>
-                                </div>
+                              {isAdmin && hasExtracted && (
+                                <button
+                                  type="button"
+                                  disabled={verifyMutation.isPending || selectedId === null}
+                                  onClick={() => {
+                                    setActionError(null);
+                                    if (selectedId !== null) verifyMutation.mutate(selectedId);
+                                  }}
+                                  className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-semibold text-white rounded disabled:opacity-50"
+                                  style={{ backgroundColor: '#27a644' }}
+                                >
+                                  {verifyMutation.isPending ? (
+                                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                                  ) : (
+                                    <CheckCircle2 className="h-3.5 w-3.5" />
+                                  )}
+                                  {verifyMutation.isPending ? 'Applying…' : 'Verify & Apply'}
+                                </button>
                               )}
                             </div>
-                          )}
+                          </div>
+
+                          <div className="flex-1 min-h-0 overflow-auto p-3 space-y-3">
+                            {r.extracted_data && (
+                              <div>
+                                <h4
+                                  className="text-[11px] font-semibold uppercase tracking-wider mb-1"
+                                  style={{ color: 'var(--th-text-tertiary)' }}
+                                >
+                                  Detection data
+                                </h4>
+                                <pre
+                                  className="p-2 rounded-lg font-mono text-[11px] whitespace-pre-wrap max-h-[100px] overflow-auto"
+                                  style={{
+                                    backgroundColor: 'var(--th-surface-2)',
+                                    color: 'var(--th-text-secondary)',
+                                    border: '1px solid var(--th-border)',
+                                  }}
+                                >
+                                  {JSON.stringify(r.extracted_data, null, 2)}
+                                </pre>
+                              </div>
+                            )}
+
+                            {!hasExtracted && (
+                              <p className="text-xs" style={{ color: 'var(--th-text-quaternary)' }}>
+                                Auto-extract the full document, or select text/area on the left to populate fields.
+                              </p>
+                            )}
+
+                            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                              {fieldLabels.map(([key, label]) => (
+                                <div key={key}>
+                                  <label
+                                    className="block text-[11px] uppercase tracking-wider mb-1"
+                                    style={labelStyle}
+                                  >
+                                    {label}
+                                  </label>
+                                  <input
+                                    value={form[key]}
+                                    onChange={(e) => updateField(key, e.target.value)}
+                                    disabled={!isAdmin}
+                                    className="w-full px-2.5 py-2 text-sm rounded-comfortable focus:outline-none disabled:opacity-60"
+                                    style={inputStyle}
+                                  />
+                                </div>
+                              ))}
+                            </div>
+                            {(customers.length > 0 || lineItems.length > 0) && (
+                              <div className="grid grid-cols-1 gap-3">
+                                {customers.length > 0 && (
+                                  <div>
+                                    <h5 className="text-[11px] uppercase tracking-wider mb-1" style={labelStyle}>
+                                      Customers ({customers.length})
+                                    </h5>
+                                    <pre
+                                      className="p-2 rounded-lg font-mono text-[11px] whitespace-pre-wrap max-h-[140px] overflow-auto"
+                                      style={{
+                                        backgroundColor: 'var(--th-surface-2)',
+                                        color: 'var(--th-text-secondary)',
+                                        border: '1px solid var(--th-border)',
+                                      }}
+                                    >
+                                      {JSON.stringify(customers, null, 2)}
+                                    </pre>
+                                  </div>
+                                )}
+                                {lineItems.length > 0 && (
+                                  <div>
+                                    <h5 className="text-[11px] uppercase tracking-wider mb-1" style={labelStyle}>
+                                      Line items ({lineItems.length})
+                                    </h5>
+                                    <pre
+                                      className="p-2 rounded-lg font-mono text-[11px] whitespace-pre-wrap max-h-[140px] overflow-auto"
+                                      style={{
+                                        backgroundColor: 'var(--th-surface-2)',
+                                        color: 'var(--th-text-secondary)',
+                                        border: '1px solid var(--th-border)',
+                                      }}
+                                    >
+                                      {JSON.stringify(lineItems, null, 2)}
+                                    </pre>
+                                  </div>
+                                )}
+                              </div>
+                            )}
+
+                            {!isAdmin && (
+                              <p className="text-xs" style={{ color: 'var(--th-text-quaternary)' }}>
+                                Admin role required to extract, verify, or dismiss.
+                              </p>
+                            )}
+                          </div>
                         </div>
-                      )}
+                      </div>
 
-                      {/* Actions */}
+                      {/* Bottom actions */}
                       <div className="flex flex-wrap gap-2 pt-1">
-                        {isAdmin && (
-                          <button
-                            type="button"
-                            disabled={autoExtractMutation.isPending || selectedId === null}
-                            onClick={() => {
-                              setActionError(null);
-                              setSuccessMsg(null);
-                              if (selectedId !== null) autoExtractMutation.mutate(selectedId);
-                            }}
-                            className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-white rounded-comfortable disabled:opacity-50"
-                            style={{ backgroundColor: 'var(--color-brand)' }}
-                          >
-                            {autoExtractMutation.isPending ? (
-                              <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                            ) : (
-                              <Sparkles className="h-3.5 w-3.5" />
-                            )}
-                            {autoExtractMutation.isPending ? 'Extracting…' : 'Auto-Extract'}
-                          </button>
-                        )}
-
-                        {isAdmin && hasExtracted && (
-                          <button
-                            type="button"
-                            disabled={verifyMutation.isPending || selectedId === null}
-                            onClick={() => {
-                              setActionError(null);
-                              if (selectedId !== null) verifyMutation.mutate(selectedId);
-                            }}
-                            className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-white rounded-comfortable disabled:opacity-50"
-                            style={{ backgroundColor: '#27a644' }}
-                          >
-                            {verifyMutation.isPending ? (
-                              <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                            ) : (
-                              <CheckCircle2 className="h-3.5 w-3.5" />
-                            )}
-                            {verifyMutation.isPending ? 'Applying…' : 'Verify & Apply'}
-                          </button>
-                        )}
-
                         {isAdmin && (
                           <button
                             type="button"
@@ -741,12 +963,6 @@ export default function Reviews() {
                             )}
                             Mark In Review
                           </button>
-                        )}
-
-                        {!isAdmin && (
-                          <p className="text-xs self-center" style={{ color: 'var(--th-text-quaternary)' }}>
-                            Admin role required to extract, verify, or dismiss.
-                          </p>
                         )}
                       </div>
                     </div>

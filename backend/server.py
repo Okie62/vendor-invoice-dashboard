@@ -1803,39 +1803,38 @@ def extract_selection_review(review_id):
     if not has_text and not has_image:
         return jsonify({
             "error": "Provide either text or image in the request body"
-        detail: dict = review  # type: ignore[assignment]
-        vendor_name = detail.get("vendor_name") or ""
+        }), 400
 
-        try:
-            # Prefer image (area selection) when both are present; text path otherwise.
-            if image_b64:
-                fields = extract_from_image(
-                    image_b64,
-                    vendor_name=vendor_name,
-                    mime_type=mime_type,
-                )
-            else:
-                fields = extract_from_text_snippet(
-                    selected_text,
-                    vendor_name=vendor_name,
-                )
-        except Exception as e:
-            from llm_extractor import LLMNotConfiguredError
-            if isinstance(e, LLMNotConfiguredError):
-                return jsonify({
-                    "error": "LLM extraction not configured — set XAI_API_KEY"
-                }), 503
+    vendor_name = detail.get("vendor_name") or ""
+    try:
+        if has_image:
+            fields = extract_from_image(
+                image,
+                vendor_name=vendor_name,
+                mime_type=mime_type,
+            )
+        else:
+            fields = extract_from_text_snippet(
+                text,
+                vendor_name=vendor_name,
+            )
+    except Exception as e:
+        from llm_extractor import LLMNotConfiguredError
+        if isinstance(e, LLMNotConfiguredError):
             return jsonify({
-                "error": f"LLM extraction failed: {e}"
-            }), 502
+                "error": "LLM extraction not configured — set XAI_API_KEY"
+            }), 503
+        return jsonify({
+            "error": f"LLM extraction failed: {e}"
+        }), 502
 
-        return jsonify({"success": True, "extracted_fields": fields})
+    return jsonify({"success": True, "extracted_fields": fields})
 
 
-        @app.route("/api/formats")
-        @require_auth
-        def list_formats():
-        """GET /api/formats — list registered formats per vendor."""
+@app.route("/api/formats")
+@require_auth
+def list_formats():
+    """GET /api/formats — list registered formats per vendor."""
     conn = get_db()
     rows = conn.execute(
         "SELECT f.*, v.name as vendor_name "
